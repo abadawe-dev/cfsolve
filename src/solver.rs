@@ -18,7 +18,8 @@ use crate::session::{self, Clearance, Discard, Expect, Outcome, Sink};
 /// How one solve reaches the network, and where its diagnostics go.
 #[derive(Clone, Default)]
 pub struct Options {
-    /// An `http://`, `https://`, `socks5://`, or `socks5h://` proxy for every request.
+    /// An `http://`, `https://`, `socks5://`, or `socks5h://` proxy for every request. Without
+    /// one, requests connect directly, whatever the system's proxy settings or `HTTPS_PROXY`.
     pub proxy: Option<String>,
     /// A PEM certificate to trust instead of the built-in roots, such as a recording proxy's CA.
     pub trusted_root: Option<Vec<u8>>,
