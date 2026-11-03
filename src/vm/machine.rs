@@ -30,6 +30,12 @@ pub struct Definition<'a> {
     dispatch: Dispatch<'a>,
 }
 
+// SAFETY: A definition holds shared references into a tree a `ParsedScript` owns (every `Script`
+// comes from `ParsedScript::script`), and plain data. Nothing writes that tree once it is built,
+// which is what makes `ParsedScript` `Sync`. Threads decoding beside a disassembly only read the
+// definition, each through a machine of its own.
+unsafe impl Sync for Definition<'_> {}
+
 impl<'a> Definition<'a> {
     /// Finds the VM in `script` from its program runner. Fails unless the run function's
     /// dispatch loop has the expected shape.
@@ -53,7 +59,7 @@ impl<'a> Definition<'a> {
 
 /// One session's VM, ready to decode instructions.
 pub struct Machine<'definition> {
-    definition: &'definition Definition<'definition>,
+    pub(super) definition: &'definition Definition<'definition>,
     pub(super) session: Session<'definition>,
     /// The opcode decoder, run natively, if it has the recognized shape.
     pub(super) native_dispatch: Option<NativeDispatch<'definition>>,
