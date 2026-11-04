@@ -12,8 +12,9 @@ use crate::vm::Term;
 #[must_use]
 pub(crate) fn option_read(index: &Index<'_>, pc: u32, term: &Term) -> Option<String> {
     let option = index.member(pc, term)?;
-    let options = index.member(option.pc, &option.object)?;
-    (options.key == "_cf_chl_opt").then_some(option.key)
+    index
+        .holds_options(option.pc, &option.object)
+        .then_some(option.key)
 }
 
 /// Finds a record's start, finish, and duration stores. Uses the first `finished - started`

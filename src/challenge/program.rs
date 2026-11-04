@@ -138,15 +138,25 @@ impl<'source> PreparedSession<'source> {
             options: &request.options,
             runner,
             encoders: BTreeSet::new(),
-            programs: BTreeMap::new(),
-            templates: Vec::new(),
+            default: Startup::default(),
+            optional: Startup::default(),
+            in_optional: false,
         };
         components.visit_program(script.program);
-        let encoder = candidates::exactly_one(components.encoders, "XHR body encoder")?;
+        let Components {
+            encoders,
+            default,
+            optional,
+            ..
+        } = components;
+        let encoder = candidates::exactly_one(encoders, "XHR body encoder")?;
+        let Startup {
+            programs,
+            templates,
+        } = Startup::chosen(default, optional);
         let (initial_program, initialize_key) =
-            candidates::exactly_one(components.programs, "literal initial VM program")?;
-        let payload_fields =
-            candidates::exactly_one(components.templates, "first payload template")??;
+            candidates::exactly_one(programs, "literal initial VM program")?;
+        let payload_fields = candidates::exactly_one(templates, "first payload template")??;
 
         // The encoder assignment may be a standalone statement or part of a sequence or chain.
         // Search within IIFE statements without entering their nested functions.
@@ -462,6 +472,15 @@ impl<'a> Visit<'a> for Calls<'a> {
     }
 }
 
+/// The literal programs and payload templates of one startup path.
+#[derive(Default)]
+struct Startup {
+    /// Literal programs passed to the runner, each with the source of its first call.
+    /// Orchestrators may repeat a program for different startup paths.
+    programs: BTreeMap<String, String>,
+    templates: Vec<Result<Vec<Field>>>,
+}
+
 /// Collects components for [`PreparedSession::try_new`].
 struct Components<'session, 'a> {
     script: Script<'a>,
@@ -470,10 +489,42 @@ struct Components<'session, 'a> {
     runner: String,
     /// Functions whose result is handed straight to `send`.
     encoders: BTreeSet<Binding<'a>>,
-    /// Literal programs passed to the runner, each with the source of its first call.
-    /// Orchestrators may repeat a program for different startup paths.
-    programs: BTreeMap<String, String>,
-    templates: Vec<Result<Vec<Field>>>,
+    /// What the orchestrator's default startup runs and sends.
+    default: Startup,
+    /// What runs inside `if (<option>) { ... }` for an option the page sets. A precursor
+    /// interstitial page sets `pi: true`, and its orchestrator then runs a startup of its own,
+    /// with its own initial program and payload, and returns before the default one.
+    optional: Startup,
+    in_optional: bool,
+}
+
+impl Startup {
+    /// The startup the page's options choose. Each component found on a set option's path
+    /// replaces the default one, as the real script never reaches the default startup there.
+    fn chosen(default: Self, optional: Self) -> Self {
+        Self {
+            programs: if optional.programs.is_empty() {
+                default.programs
+            } else {
+                optional.programs
+            },
+            templates: if optional.templates.is_empty() {
+                default.templates
+            } else {
+                optional.templates
+            },
+        }
+    }
+}
+
+impl Components<'_, '_> {
+    fn found(&mut self) -> &mut Startup {
+        if self.in_optional {
+            &mut self.optional
+        } else {
+            &mut self.default
+        }
+    }
 }
 
 impl<'a> Visit<'a> for Components<'_, 'a> {
@@ -485,7 +536,10 @@ impl<'a> Visit<'a> for Components<'_, 'a> {
                 .and_then(|argument| ast::static_str(argument.as_expression()?))
         {
             let text = self.script.text(call).to_owned();
-            self.programs.entry(program.to_owned()).or_insert(text);
+            self.found()
+                .programs
+                .entry(program.to_owned())
+                .or_insert(text);
         }
         if let Some(member) = call.callee.without_parentheses().as_member_expression()
             && ast::member_str(member) == Some("send")
@@ -499,13 +553,22 @@ impl<'a> Visit<'a> for Components<'_, 'a> {
 
     fn visit_if_statement(&mut self, conditional: &IfStatement<'a>) {
         let options = self.options;
-        source::visit_taken_branches(self, conditional, options);
+        if !self.in_optional && source::is_set_option(&conditional.test, options) {
+            self.in_optional = true;
+            self.visit_statement(&conditional.consequent);
+            self.in_optional = false;
+            if let Some(alternate) = &conditional.alternate {
+                self.visit_statement(alternate);
+            }
+        } else {
+            source::visit_taken_branches(self, conditional, options);
+        }
     }
 
     fn visit_object_expression(&mut self, object: &ObjectExpression<'a>) {
         if source::is_payload_template(object, self.options) {
-            self.templates
-                .push(payload_fields(self.script, object, self.options));
+            let fields = payload_fields(self.script, object, self.options);
+            self.found().templates.push(fields);
         }
         walk::walk_object_expression(self, object);
     }
@@ -556,5 +619,41 @@ mod tests {
         );
         assert!(!defines_p3("P3 = 1;"));
         assert!(!defines_p3("P3 = (function() {}, 1);"));
+    }
+
+    /// A precursor interstitial's orchestrator runs its own initial program when the page sets
+    /// `pi`, and returns before the default startup and its program.
+    #[test]
+    fn a_set_options_startup_replaces_the_default_one() {
+        let programs = |options: &str| {
+            let source = format!(
+                "window._cf_chl_opt = {{{options}}};
+                function startup() {{ w.run(`DEFAULT`); }}
+                function begin() {{
+                    if (w._cf_chl_opt.pi) {{ w.run(`PRECURSOR`); return; }}
+                    startup();
+                }}"
+            );
+            let parsed = ParsedScript::parse("t.js", &source).unwrap();
+            let script = parsed.script();
+            let options = source::bootstrap_options(script);
+            let mut components = Components {
+                script,
+                options: &options,
+                runner: "run".into(),
+                encoders: BTreeSet::new(),
+                default: Startup::default(),
+                optional: Startup::default(),
+                in_optional: false,
+            };
+            components.visit_program(script.program);
+            let Components {
+                default, optional, ..
+            } = components;
+            let chosen = Startup::chosen(default, optional);
+            chosen.programs.into_keys().collect::<Vec<_>>()
+        };
+        assert_eq!(programs("pi: true"), ["PRECURSOR"]);
+        assert_eq!(programs("cType: 'managed'"), ["DEFAULT"]);
     }
 }

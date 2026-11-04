@@ -2,9 +2,12 @@
 //! client's fetch measurements to that format. Depending on the build, entries contain rounded-down
 //! phase durations or the original timestamps.
 
-use oxc::ast::ast::{AssignmentTarget, Expression, FunctionBody};
+use anyhow::Result;
+use oxc::ast::ast::{AssignmentTarget, Expression, FunctionBody, MemberExpression};
+use oxc::ast_visit::{Visit, walk};
 use oxc::syntax::operator::BinaryOperator;
 
+use crate::candidates;
 use crate::challenge::expression::{self, BuiltObject, ObjectField};
 use crate::js::ast::{self, Binding, Script};
 use crate::js::{JsObject, JsValue, json};
@@ -128,6 +131,27 @@ pub(super) fn reduction<'a>(
     built
         .iter()
         .find_map(|object| reduced_fields(script, &object.fields, &measured))
+}
+
+/// The option a reducer's `body` pushes its entries into, as `_cf_chl_opt.<name>?.push(entry)`.
+/// A page orchestrator collects them there for the programs it runs to read.
+pub(super) fn collection(body: &FunctionBody<'_>) -> Result<Option<String>> {
+    struct Pushes(Vec<String>);
+
+    impl<'a> Visit<'a> for Pushes {
+        fn visit_member_expression(&mut self, member: &MemberExpression<'a>) {
+            if ast::member_str(member) == Some("push")
+                && let Some(option) = expression::option_key(member.object().without_parentheses())
+            {
+                self.0.push(option.to_owned());
+            }
+            walk::walk_member_expression(self, member);
+        }
+    }
+
+    let mut pushes = Pushes(Vec::new());
+    pushes.visit_function_body(body);
+    candidates::at_most_one_distinct(pushes.0, "resource timing collection")
 }
 
 /// Recognizes a reduced entry when it has enough fields, includes the resource name, and uses
