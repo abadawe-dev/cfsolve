@@ -41,6 +41,9 @@ regex = "1.12.2"
 ryu-js = "1.0.2"
 # Fast hashing for the VM interpreter's identifier and register maps.
 rustc-hash = "2.1.1"
+# Maps by binding, probed without cloning the binding's name.
+hashbrown = "0.16.1"
+smallvec = "1.15.1"
 # `deterministic` keeps attributes in source order, which the page fingerprint
 # reports verbatim.
 scraper = { version = "0.27.0", features = ["deterministic"] }
@@ -95,6 +98,12 @@ http2 = { path = "vendor/http2" }
 
 # Full debug info for swc dominates link time and target/ size. Line tables
 # keep file:line in this crate's backtraces; dependencies get none.
+# The solver spends its time in the interpreter's closures and the deobfuscator's walks, whose
+# calls cross crates and codegen units.
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
 [profile.dev]
 debug = "line-tables-only"
 

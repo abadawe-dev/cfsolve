@@ -3,6 +3,7 @@
 
 use std::mem;
 
+use smallvec::SmallVec;
 use swc_core::ecma::ast::{
     ArrowExpr, AssignExpr, AssignOp, ClassDecl, Expr, FnDecl, ForHead, Function, Id, Ident, Param,
     Program, Prop, UpdateExpr, VarDeclarator,
@@ -10,7 +11,7 @@ use swc_core::ecma::ast::{
 use swc_core::ecma::visit::{Visit, VisitWith};
 use swc_ecma_utils::DestructuringFinder;
 
-use crate::deobfuscate::{HashMap, HashSet};
+use crate::deobfuscate::{HashMap, HashSet, IdMap, IdRef};
 
 /// Tracks writes and references by resolved [`Id`]. Names are not enough
 /// because the obfuscator reuses them across scopes.
@@ -21,8 +22,9 @@ use crate::deobfuscate::{HashMap, HashSet};
 /// be used for substitution only when its binding has exactly one write.
 #[derive(Default)]
 pub(crate) struct Bindings {
-    writes: HashMap<Id, Vec<Write>>,
-    references: HashMap<Id, usize>,
+    /// Most bindings are written once, so their writes are kept inline.
+    writes: IdMap<SmallVec<[Write; 1]>>,
+    references: IdMap<usize>,
     /// Bindings that receive a copy of each binding's value.
     copies: HashMap<Id, Vec<Id>>,
     /// Parameters of functions and arrows.
@@ -31,6 +33,13 @@ pub(crate) struct Bindings {
     mapped: HashSet<Id>,
     /// Whether the function being visited refers to its `arguments`.
     uses_arguments: bool,
+}
+
+/// See [`Bindings::size`].
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Size {
+    writes: usize,
+    references: usize,
 }
 
 /// One write, and the assigned value when analysis can follow it.
@@ -42,15 +51,29 @@ enum Write {
 
 impl Bindings {
     #[must_use]
-    pub(crate) fn collect(program: &Program) -> Self {
-        let mut bindings = Self::default();
+    pub(crate) fn collect(program: &Program, size: Size) -> Self {
+        let mut bindings = Self {
+            writes: IdMap::with_capacity_and_hasher(size.writes, Default::default()),
+            references: IdMap::with_capacity_and_hasher(size.references, Default::default()),
+            ..Self::default()
+        };
         program.visit_with(&mut bindings);
         bindings
     }
 
+    /// How large the tables came out, which the next collection starts from: a rewrite changes
+    /// few bindings, so growing the tables again entry by entry would be wasted work.
+    #[must_use]
+    pub(crate) fn size(&self) -> Size {
+        Size {
+            writes: self.writes.len(),
+            references: self.references.len(),
+        }
+    }
+
     #[must_use]
     pub(crate) fn write_count(&self, id: &Id) -> usize {
-        self.writes.get(id).map_or(0, Vec::len)
+        self.writes.get(id).map_or(0, |writes| writes.len())
     }
 
     /// Checks for exactly one write, allowing later reads to use that assigned value.
@@ -140,8 +163,11 @@ impl Bindings {
         self.writes.entry(id).or_default().push(write);
     }
 
-    fn reference(&mut self, id: Id) {
-        *self.references.entry(id).or_default() += 1;
+    fn reference(&mut self, identifier: &Ident) {
+        *self
+            .references
+            .entry_ref(&IdRef::from(identifier))
+            .or_default() += 1;
     }
 }
 
@@ -221,14 +247,14 @@ impl Visit for Bindings {
 
     fn visit_expr(&mut self, expression: &Expr) {
         if let Expr::Ident(id) = expression {
-            self.reference(id.to_id());
+            self.reference(id);
         }
         expression.visit_children_with(self);
     }
 
     fn visit_prop(&mut self, property: &Prop) {
         if let Prop::Shorthand(id) = property {
-            self.reference(id.to_id());
+            self.reference(id);
         }
         property.visit_children_with(self);
     }
@@ -250,7 +276,7 @@ mod tests {
                 return once.x + escaped.y + m.z + m[\"w\"] + mutated.x + { param };
             }",
             |program, id| {
-                let writes = Bindings::collect(program);
+                let writes = Bindings::collect(program, Default::default());
                 assert!(writes.is_written_once(&id("once")));
                 assert!(!writes.is_written_once(&id("twice")));
                 assert!(writes.is_written_once(&id("escaped")));
@@ -277,7 +303,7 @@ mod tests {
                 return late;
             }",
             |program, id| {
-                let bindings = Bindings::collect(program);
+                let bindings = Bindings::collect(program, Default::default());
                 assert_eq!(bindings.root(&id("q")), id("h"));
                 assert_eq!(bindings.root(&id("late")), id("d"));
                 assert_eq!(bindings.root(&id("mixed")), id("mixed"));
@@ -287,7 +313,7 @@ mod tests {
             "function f(a, [b]) { return () => arguments[0]; }
              function g(c) { return function () { return arguments; }; }",
             |program, id| {
-                let bindings = Bindings::collect(program);
+                let bindings = Bindings::collect(program, Default::default());
                 assert!(bindings.is_mapped_parameter(&id("a")));
                 assert!(bindings.is_mapped_parameter(&id("b")));
                 assert!(!bindings.is_mapped_parameter(&id("c")));

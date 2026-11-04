@@ -8,9 +8,8 @@
 //! Generates a fresh session ID, credentials, certificate fingerprint, mDNS names, foundations,
 //! and host ports.
 
-use std::collections::HashMap;
-
 use anyhow::{Context, Result};
+use rustc_hash::FxHashMap as HashMap;
 
 use super::media::{self, Candidate, Measurement};
 use crate::js::{JsValue, json};
@@ -102,8 +101,8 @@ pub(crate) fn refresh(previous: Measurement) -> Result<Measurement> {
     let identity = Identity::new();
     let offer = identity.offer(offer);
     let started_ms = performance_clock::epoch_ms();
-    let mut names: HashMap<String, String> = HashMap::new();
-    let mut foundations: HashMap<String, u32> = HashMap::new();
+    let mut names: HashMap<String, String> = HashMap::default();
+    let mut foundations: HashMap<String, u32> = HashMap::default();
     let mut candidates = Vec::new();
     for recorded_candidate in &connection.published_candidates {
         let line = recorded_candidate
@@ -166,7 +165,7 @@ fn uuid() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use rustc_hash::FxHashSet as HashSet;
 
     use super::*;
     use crate::js;

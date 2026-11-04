@@ -1,10 +1,11 @@
 //! Caches common listing lookups for analysis.
 
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, Range, RangeBounds};
 
 use anyhow::{Context, Result};
+use rustc_hash::FxHashMap as HashMap;
 
 use super::query::Store;
 use crate::candidates;
@@ -29,7 +30,7 @@ impl<'listing> Index<'listing> {
         let mut strings = BTreeMap::new();
         let mut header = BTreeMap::new();
         let mut in_header = true;
-        let mut assignments: HashMap<u8, Vec<u32>> = HashMap::new();
+        let mut assignments: HashMap<u8, Vec<u32>> = HashMap::default();
         for (&pc, instruction) in &listing.instructions {
             for effect in instruction.effects() {
                 if let Effect::Set(register, value) = effect {
@@ -53,7 +54,7 @@ impl<'listing> Index<'listing> {
             }
         }
         let entries: BTreeSet<u32> = listing.functions.iter().map(|entry| entry.pc).collect();
-        let mut hidden: HashMap<u32, Vec<&Hidden>> = HashMap::new();
+        let mut hidden: HashMap<u32, Vec<&Hidden>> = HashMap::default();
         for branch in &listing.hidden {
             hidden.entry(branch.compare).or_default().push(branch);
         }
@@ -107,7 +108,7 @@ impl<'listing> Index<'listing> {
                     .is_some_and(|text| text == "window"),
                 _ => false,
             };
-            let mut reads: HashMap<u8, usize> = HashMap::new();
+            let mut reads: HashMap<u8, usize> = HashMap::default();
             for effect in self.effects() {
                 effect.visit_terms(&mut |term| {
                     if let Term::Get(object, key) = term

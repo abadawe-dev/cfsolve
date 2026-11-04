@@ -7,11 +7,10 @@
 //! Probe-local mappings override the program-wide map because one build may reuse a name where
 //! another uses separate names.
 
-use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::ops::Range;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use super::reference::REFERENCE;
 use crate::js::{JsObject, JsValue};
@@ -84,10 +83,10 @@ impl Vocabulary {
 
     fn between<S: AsRef<[String]>>(session: &[S], reference: &[Vec<String>]) -> Self {
         let (partners, candidates) = pair_probes(session, reference);
-        let mut all = Votes::new();
+        let mut all = Votes::default();
         let mut probes = Vec::with_capacity(session.len());
         for (index, strings) in session.iter().enumerate() {
-            let mut votes = Votes::new();
+            let mut votes = Votes::default();
             if let Some(partner) = partners[index] {
                 for pair in aligned_names(strings.as_ref(), &reference[partner - 1]) {
                     *votes.entry(pair).or_default() += 1;
@@ -233,7 +232,7 @@ fn best_partners<'a>(
     votes: &Votes<'a>,
     side: impl Fn((&'a str, &'a str)) -> &'a str,
 ) -> HashSet<(&'a str, &'a str)> {
-    let mut best: HashMap<&str, ((&str, &str), usize)> = HashMap::new();
+    let mut best: HashMap<&str, ((&str, &str), usize)> = HashMap::default();
     for (&pair, &count) in votes {
         let (best_pair, best_count) = best.entry(side(pair)).or_insert((pair, 0));
         if count > *best_count || (count == *best_count && pair < *best_pair) {
@@ -282,7 +281,7 @@ fn pair_probes<S: AsRef<[String]>>(
     for &(index, candidate) in &pairings {
         best[index].get_or_insert(candidate);
     }
-    let mut used = HashSet::new();
+    let mut used = HashSet::default();
     let mut pairs = vec![None; session.len()];
     for (index, candidate) in pairings {
         if candidate.similarity < MIN_PAIR_SIMILARITY {
@@ -308,7 +307,7 @@ fn distinctive<'a>(probes: impl Iterator<Item = &'a [String]>) -> Vec<HashSet<&'
                 .collect()
         })
         .collect();
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut counts: HashMap<&str, usize> = HashMap::default();
     for set in &sets {
         for text in set {
             *counts.entry(text).or_default() += 1;
@@ -429,7 +428,7 @@ struct Run {
 /// parts before and after it. Appends an empty run at each end. Contiguous anchors prevent
 /// distant repeated strings from distorting alignment.
 fn matching_runs(session: &[&str], reference: &[&str]) -> Vec<Run> {
-    let mut positions: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
+    let mut positions: HashMap<&str, Vec<usize>> = HashMap::default();
     for (j, text) in reference.iter().enumerate() {
         positions.entry(text).or_default().push(j);
     }
@@ -460,7 +459,7 @@ fn matching_runs(session: &[&str], reference: &[&str]) -> Vec<Run> {
 /// contains ordered reference positions for each string.
 fn longest_run(
     session: &[&str],
-    positions: &FxHashMap<&str, Vec<usize>>,
+    positions: &HashMap<&str, Vec<usize>>,
     rows: Range<usize>,
     columns: Range<usize>,
 ) -> Run {
@@ -471,8 +470,8 @@ fn longest_run(
     };
     // `run[j]` holds the previous row's match length ending at reference position `j`; `next`
     // holds the current row.
-    let mut run: FxHashMap<usize, usize> = FxHashMap::default();
-    let mut next = FxHashMap::default();
+    let mut run: HashMap<usize, usize> = HashMap::default();
+    let mut next = HashMap::default();
     for i in rows {
         next.clear();
         let occurrences = positions.get(session[i]).into_iter().flatten();

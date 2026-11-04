@@ -4,45 +4,78 @@
 //! `slice`, `+` and `*` on constant registers rewrites each unpacking call to the resulting
 //! string, so readers of the listing see an ordinary string load.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::ops::ControlFlow;
-use std::rc::Rc;
+use std::sync::Arc;
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use swc_core::ecma::ast::BinaryOp;
 
 use super::output::{Constant, Effect, Listing, Path, Term};
 use super::{dataflow, disassemble};
 
-/// Constant registers on entry to an instruction, shared as the dataflow copies them per path.
-type Registers = BTreeMap<u8, Rc<Constant>>;
+/// Constant registers on entry to an instruction, sorted by register. A vector because the
+/// dataflow copies these once per path, and there are few of them.
+#[derive(Clone, Default)]
+struct Registers(Vec<(u8, Arc<Constant>)>);
+
+impl Registers {
+    fn get(&self, register: u8) -> Option<&Arc<Constant>> {
+        let found = self.0.binary_search_by_key(&register, |entry| entry.0);
+        found.ok().map(|index| &self.0[index].1)
+    }
+
+    fn insert(&mut self, register: u8, constant: Arc<Constant>) {
+        match self.0.binary_search_by_key(&register, |entry| entry.0) {
+            Ok(index) => self.0[index].1 = constant,
+            Err(index) => self.0.insert(index, (register, constant)),
+        }
+    }
+
+    fn remove(&mut self, register: u8) {
+        if let Ok(index) = self.0.binary_search_by_key(&register, |entry| entry.0) {
+            self.0.remove(index);
+        }
+    }
+}
+
+impl dataflow::Facts for Registers {
+    fn meet(&mut self, other: &Self) -> bool {
+        let before = self.0.len();
+        self.0
+            .retain(|(register, constant)| other.get(*register) == Some(constant));
+        self.0.len() < before
+    }
+}
 
 /// Constants held by temporaries.
-type Temporaries = HashMap<usize, Rc<Constant>>;
+type Temporaries = FxHashMap<usize, Arc<Constant>>;
 
 pub(super) fn fold(listing: &mut Listing) {
     // Unrecorded entries, such as functions and hidden targets, start with nothing known.
     let functions = listing.functions.iter().map(|function| function.pc);
     let hidden = listing.hidden.iter().map(|hidden| hidden.target.pc);
-    let incoming = forward(listing, functions.chain(hidden));
     // A catch path must not erase facts already recovered on the normal path.
     // Fold its exclusive instructions separately with unknown entry registers.
-    let exceptional = forward(listing, disassemble::exception_entries(listing));
-    for (pc, instruction) in &mut listing.instructions {
-        let Some(entry) = incoming.get(pc).or_else(|| exceptional.get(pc)) else {
-            continue;
+    let (incoming, exceptional) = disassemble::both(
+        || forward(listing, functions.chain(hidden)),
+        || forward(listing, disassemble::exception_entries(listing)),
+    );
+    disassemble::for_each_instruction(listing, |pc, instruction| {
+        let Some(entry) = incoming.get(&pc).or_else(|| exceptional.get(&pc)) else {
+            return;
         };
         for path in &mut instruction.paths {
             rewrite(path, entry.clone());
         }
-    }
+    });
 }
 
 /// The constant registers on entry to each instruction reachable from `entries`.
-fn forward(listing: &Listing, entries: impl IntoIterator<Item = u32>) -> BTreeMap<u32, Registers> {
-    let entries = entries.into_iter().map(|pc| (pc, Registers::new()));
+fn forward(listing: &Listing, entries: impl IntoIterator<Item = u32>) -> FxHashMap<u32, Registers> {
+    let entries = entries.into_iter().map(|pc| (pc, Registers::default()));
     let ControlFlow::Continue(incoming) = dataflow::forward(listing, entries, |_, path, known| {
-        let mut temporaries = Temporaries::new();
+        let mut temporaries = Temporaries::default();
         for effect in &path.effects {
             step(effect, known, &mut temporaries);
         }
@@ -53,9 +86,9 @@ fn forward(listing: &Listing, entries: impl IntoIterator<Item = u32>) -> BTreeMa
 
 /// Rewrites folded string-method results in `path` to constants.
 fn rewrite(path: &mut Path, mut known: Registers) {
-    let mut temporaries = Temporaries::new();
+    let mut temporaries = Temporaries::default();
     // Temporaries holding a folded call.
-    let mut folded_temporaries = HashSet::new();
+    let mut folded_temporaries = FxHashSet::default();
     for effect in &mut path.effects {
         let folded = match &*effect {
             // Only `charCodeAt` and `slice` calls fold.
@@ -76,7 +109,7 @@ fn rewrite(path: &mut Path, mut known: Registers) {
             }
         }
         if let (Some(constant), Effect::Let(_, term) | Effect::Set(_, term)) = (folded, effect) {
-            *term = Term::Const(Rc::unwrap_or_clone(constant));
+            *term = Term::Const(Arc::unwrap_or_clone(constant));
         }
     }
 }
@@ -85,31 +118,33 @@ fn rewrite(path: &mut Path, mut known: Registers) {
 /// caller's registers alone.
 fn step(effect: &Effect, known: &mut Registers, temporaries: &mut Temporaries) {
     match effect {
-        Effect::Let(temporary, term) => match value(term, known, temporaries) {
-            Some(constant) => temporaries.insert(*temporary, constant),
-            None => temporaries.remove(temporary),
-        },
+        Effect::Let(temporary, term) => {
+            match value(term, known, temporaries) {
+                Some(constant) => temporaries.insert(*temporary, constant),
+                None => temporaries.remove(temporary),
+            };
+        }
         Effect::Set(register, term) => match value(term, known, temporaries) {
             Some(constant) => known.insert(*register, constant),
-            None => known.remove(register),
+            None => known.remove(*register),
         },
-        _ => None,
-    };
+        _ => {}
+    }
 }
 
 /// The string or number `term` evaluates to, if constant.
-fn value(term: &Term, known: &Registers, temporaries: &Temporaries) -> Option<Rc<Constant>> {
+fn value(term: &Term, known: &Registers, temporaries: &Temporaries) -> Option<Arc<Constant>> {
     let value = |term| value(term, known, temporaries);
     let number = |term| match *value(term)? {
         Constant::Number(number) => Some(number),
         _ => None,
     };
-    let number_constant = |number| Some(Rc::new(Constant::Number(number)));
+    let number_constant = |number| Some(Arc::new(Constant::Number(number)));
     match term {
         Term::Const(constant @ (Constant::String(_) | Constant::Number(_))) => {
-            Some(Rc::new(constant.clone()))
+            Some(Arc::new(constant.clone()))
         }
-        Term::Reg(register) => known.get(register).cloned(),
+        Term::Reg(register) => known.get(*register).cloned(),
         Term::Temp(temporary) => temporaries.get(temporary).cloned(),
         Term::Binary(BinaryOp::Add, left, right) => number_constant(number(left)? + number(right)?),
         Term::Binary(BinaryOp::Mul, left, right) => number_constant(number(left)? * number(right)?),
@@ -140,7 +175,7 @@ fn value(term: &Term, known: &Registers, temporaries: &Temporaries) -> Option<Rc
                 ("slice", [start, end]) => {
                     let end = index(end)?.min(text.len());
                     let start = index(start)?.min(end);
-                    Some(Rc::new(Constant::String(
+                    Some(Arc::new(Constant::String(
                         String::from_utf16(&text[start..end]).ok()?,
                     )))
                 }
@@ -155,6 +190,29 @@ fn value(term: &Term, known: &Registers, temporaries: &Temporaries) -> Option<Rc
 mod tests {
     use super::*;
     use crate::vm::output::{Exit, Instruction, Position};
+
+    #[test]
+    fn registers_keep_what_both_sides_agree_on() {
+        use dataflow::Facts;
+
+        let constant = |value| Arc::new(Constant::Number(value));
+        let mut known = Registers::default();
+        for (register, value) in [(3, 1.0), (1, 2.0), (2, f64::NAN)] {
+            known.insert(register, constant(value));
+        }
+        known.insert(1, constant(5.0));
+        let mut other = known.clone();
+        other.remove(3);
+        assert!(
+            known.meet(&other),
+            "register 3 is unknown on the other side"
+        );
+        assert_eq!(known.get(1), Some(&constant(5.0)));
+        assert_eq!(known.get(3), None);
+        // NaN is not equal to itself, so a register holding it never survives a meet.
+        assert_eq!(known.get(2), None);
+        assert!(!known.meet(&known.clone()), "nothing more to lose");
+    }
 
     fn string(text: &str) -> Term {
         Term::Const(Constant::String(text.into()))

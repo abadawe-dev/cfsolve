@@ -6,10 +6,11 @@
 //! the key transform's `window[name] = factory(secret)`.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use anyhow::Result;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use swc_core::ecma::ast::BinaryOp;
 
 use crate::js::{JsObject, JsValue, Options, Window, json};
@@ -58,7 +59,7 @@ pub fn read(source: &Source, program: &[u8]) -> Result<Installed> {
     let listing = source.disassemble(program)?;
     let initialization = initialization(&listing);
     let mut frame: Frame<Held> = Frame::default();
-    let mut objects: HashMap<u32, JsObject> = HashMap::new();
+    let mut objects: HashMap<u32, JsObject> = HashMap::default();
     let mut installed = Installed::default();
     for (&pc, instruction) in &listing.instructions {
         if !initialization.contains(&pc) {
@@ -198,13 +199,13 @@ fn initialization(listing: &Listing) -> BTreeSet<u32> {
     let entry = listing.functions.first().map(|function| function.pc);
     let mut reached = BTreeSet::new();
     let mut functions: Vec<u32> = entry.into_iter().collect();
-    let mut entered = HashSet::new();
+    let mut entered = HashSet::default();
     while let Some(function) = functions.pop() {
         if !entered.insert(function) {
             continue;
         }
         let entry_function = Some(function) == entry;
-        let mut closures: HashMap<u8, u32> = HashMap::new();
+        let mut closures: HashMap<u8, u32> = HashMap::default();
         let unreached = |pc: u32| !reached.contains(&pc);
         let walked = query::walk(listing, function, unreached, |_, instruction, pending| {
             for path in &instruction.paths {
@@ -239,7 +240,7 @@ fn initialization(listing: &Listing) -> BTreeSet<u32> {
 
 /// Finds the register that most return instructions write last.
 fn return_register(listing: &Listing) -> Option<u8> {
-    let mut counts: HashMap<u8, usize> = HashMap::new();
+    let mut counts: HashMap<u8, usize> = HashMap::default();
     let returns = listing
         .instructions
         .values()

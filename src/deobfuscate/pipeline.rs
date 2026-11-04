@@ -11,8 +11,8 @@ use swc::Compiler;
 use swc::config::{Config, IsModule, JscConfig, Options};
 use swc_core::common::comments::SingleThreadedComments;
 use swc_core::common::errors::Handler;
-use swc_core::common::{BytePos, FileName, GLOBALS, Globals, Mark, SourceMap};
-use swc_core::ecma::ast::{EsVersion, Pass, Program, fn_pass, noop_pass};
+use swc_core::common::{BytePos, DUMMY_SP, FileName, GLOBALS, Globals, Mark, SourceMap};
+use swc_core::ecma::ast::{EsVersion, Pass, Program, Script, fn_pass, noop_pass};
 use swc_ecma_transforms::optimization::simplify::expr::{self, Config as ExprSimplifierConfig};
 use swc_ecma_transforms::{fixer, hygiene};
 use tokio::sync::oneshot;
@@ -48,7 +48,7 @@ pub(crate) fn deobfuscate_with<T>(
 ) -> Result<(Deobfuscated, T)> {
     // Hygiene renames bindings whose references moved into conflicting scopes. It runs last
     // because it clears the syntax contexts the rewrites use.
-    run(source, STEPS, hygiene::hygiene, read)
+    run(source, STEPS, hygiene::hygiene, read, Printing::Done)
 }
 
 /// Calls `read` after normalization and table decoding, which preserve browser-visible
@@ -58,7 +58,7 @@ pub(crate) fn read_decoded<T>(
     source: String,
     read: impl FnMut(&Program, BytePos) -> Result<T>,
 ) -> Result<T> {
-    run(source, &[DECODE_STEPS], noop_pass, read)?.1
+    run(source, &[DECODE_STEPS], noop_pass, read, Printing::Skipped)?.1
 }
 
 /// A script decoded as [`read_decoded`] decodes it, on a thread of its own that starts as soon as
@@ -125,12 +125,21 @@ impl Decoding {
     }
 }
 
+/// Whether a caller wants the program printed once it has been read.
+#[derive(Clone, Copy, PartialEq)]
+enum Printing {
+    Done,
+    /// The compiler always prints what it is left with, so it is left with nothing.
+    Skipped,
+}
+
 /// Runs `steps`, then the pass `finish` returns, then `read`, and prints the result.
 fn run<T, P: Pass>(
     source: String,
     steps: &'static [&'static [Step]],
     finish: impl FnOnce() -> P,
     mut read: impl FnMut(&Program, BytePos) -> T,
+    printing: Printing,
 ) -> Result<(Deobfuscated, T)> {
     let mut result = None;
     let slot = &mut result;
@@ -146,7 +155,16 @@ fn run<T, P: Pass>(
                 fingerprinted: None,
             },
             finish(),
-            fn_pass(move |program: &mut Program| *slot = Some(read(program, start))),
+            fn_pass(move |program: &mut Program| {
+                *slot = Some(read(program, start));
+                if printing == Printing::Skipped {
+                    *program = Program::Script(Script {
+                        span: DUMMY_SP,
+                        body: Vec::new(),
+                        shebang: None,
+                    });
+                }
+            }),
         )
     });
     // The tree is gone, and with it everything in its chunk, whether or not printing succeeded.

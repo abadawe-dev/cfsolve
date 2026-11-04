@@ -1,9 +1,11 @@
 //! Forward dataflow analysis of listing control flow: [`forward`] follows recorded exits and
 //! keeps the facts all incoming paths share, repeating until they stop changing.
 
-use std::collections::btree_map::Entry;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::ControlFlow;
+
+use rustc_hash::FxHashMap;
 
 use super::{Listing, Path};
 
@@ -32,8 +34,9 @@ pub(crate) fn forward<F: Facts, B>(
     listing: &Listing,
     entries: impl IntoIterator<Item = (u32, F)>,
     mut transfer: impl FnMut(u32, &Path, &mut F) -> ControlFlow<B, bool>,
-) -> ControlFlow<B, BTreeMap<u32, F>> {
-    let mut incoming = BTreeMap::new();
+) -> ControlFlow<B, FxHashMap<u32, F>> {
+    let mut incoming =
+        FxHashMap::with_capacity_and_hasher(listing.instructions.len(), Default::default());
     let mut pending = VecDeque::new();
     for (pc, facts) in entries {
         reach(&mut incoming, &mut pending, pc, facts);
@@ -42,9 +45,14 @@ pub(crate) fn forward<F: Facts, B>(
         let Some(instruction) = listing.instructions.get(&pc) else {
             continue;
         };
-        let entry = incoming[&pc].clone();
-        for path in &instruction.paths {
-            let mut facts = entry.clone();
+        let mut entry = Some(incoming[&pc].clone());
+        for (index, path) in instruction.paths.iter().enumerate() {
+            // The last path can have the copy made for this visit.
+            let mut facts = if index + 1 == instruction.paths.len() {
+                entry.take().expect("one last path")
+            } else {
+                entry.clone().expect("taken only by the last path")
+            };
             match transfer(pc, path, &mut facts) {
                 ControlFlow::Break(stop) => return ControlFlow::Break(stop),
                 ControlFlow::Continue(false) => continue,
@@ -60,7 +68,7 @@ pub(crate) fn forward<F: Facts, B>(
 
 /// Merges incoming `facts` at `pc`, revisiting `pc` if facts are lost.
 fn reach<F: Facts>(
-    incoming: &mut BTreeMap<u32, F>,
+    incoming: &mut FxHashMap<u32, F>,
     pending: &mut VecDeque<u32>,
     pc: u32,
     facts: F,
@@ -134,7 +142,11 @@ mod tests {
         let a = || Constants::from([(1, Term::Const(Constant::String("a".into())))]);
         assert_eq!(
             incoming,
-            ControlFlow::Continue(BTreeMap::from([(0, Constants::new()), (1, a()), (2, a())])),
+            ControlFlow::Continue(FxHashMap::from_iter([
+                (0, Constants::new()),
+                (1, a()),
+                (2, a())
+            ])),
             "the two ways in from 0 disagree on register 2, only the loop's way in knows \
              register 3, and a position past the program is reached with what leads there"
         );

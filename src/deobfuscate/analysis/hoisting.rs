@@ -143,12 +143,16 @@ impl<F: HoistFacts> Hoisting<F> {
                 self.pending.entry(declaration.id.clone()).or_insert(None);
             }
             callers = vec![vec![]; declarations.len()];
-            for (caller, declaration) in declarations.iter().enumerate() {
-                statements[declaration.position].visit_with(&mut Named {
-                    indices: &indices,
-                    callers: &mut callers,
-                    caller,
-                });
+            // A lone declaration has no sibling to be called through, so its references to
+            // itself change nothing `leave` works out.
+            if declarations.len() > 1 {
+                for (caller, declaration) in declarations.iter().enumerate() {
+                    statements[declaration.position].visit_with(&mut Named {
+                        indices: &indices,
+                        callers: &mut callers,
+                        caller,
+                    });
+                }
             }
         }
         Declarations {
@@ -274,6 +278,9 @@ pub(crate) fn visit_mut_block<V: Hoisted + VisitMut>(visitor: &mut V, block: &mu
 /// declaration in scope.
 pub(crate) fn reference<V: Hoisted>(visitor: &mut V, identifier: &Ident) {
     let Hoisting { facts, pending, .. } = visitor.hoisting();
+    if pending.is_empty() {
+        return;
+    }
     if identifier.sym == "eval" {
         for known in pending.values_mut() {
             meet(known, facts);

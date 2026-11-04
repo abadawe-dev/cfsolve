@@ -12,10 +12,10 @@
 //! anonymous, uses the opening argument parenthesis, and includes native `Reflect.construct`
 //! frames. The script is sloppy code, so JavaScriptCore does not eliminate tail calls.
 
-use std::collections::{HashMap, HashSet};
 use std::mem;
 
 use anyhow::{Context, Result, bail};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
 use swc_core::common::{BytePos, Mark, Span, Spanned, SyntaxContext};
 use swc_core::ecma::ast::{
@@ -750,7 +750,7 @@ impl Appliers {
             Some((name.clone(), Applier::new(function, &values)?))
         };
         let mut helpers: HashMap<Id, Applier> = functions.iter().filter_map(applier).collect();
-        let mut merged = HashMap::new();
+        let mut merged = HashMap::default();
         let mut originals = Vec::new();
         for (name, function) in functions {
             if !helpers.contains_key(name)
@@ -812,7 +812,7 @@ fn forwarders(program: &Program, appliers: &Appliers) -> Forwarders {
     let mut collect = Collect {
         appliers,
         found: Forwarders::default(),
-        assigned: HashMap::new(),
+        assigned: HashMap::default(),
     };
     program.visit_with(&mut collect);
     collect.found.retain_assigned_once(&collect.assigned);
@@ -1015,7 +1015,7 @@ struct Copies<'constants> {
 impl<'constants> Copies<'constants> {
     fn new(constants: &'constants HashMap<Id, f64>) -> Self {
         Self {
-            arrays: HashMap::new(),
+            arrays: HashMap::default(),
             constants,
         }
     }
@@ -1400,9 +1400,9 @@ impl<'script> Scope<'script> {
                 String::new()
             },
             forwarders: Forwarders::default(),
-            assigned: HashMap::new(),
-            aliases: HashMap::new(),
-            strings: HashMap::new(),
+            assigned: HashMap::default(),
+            aliases: HashMap::default(),
+            strings: HashMap::default(),
         };
         function.body.visit_with(&mut scope);
         scope.forwarders.retain_assigned_once(&scope.assigned);

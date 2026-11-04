@@ -4,10 +4,11 @@
 //! Builds rename and physically reorder these states. State transitions determine execution
 //! order.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::RangeInclusive;
 
 use anyhow::{Context, Result, ensure};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::candidates;
 use crate::js::JsValue;
@@ -396,7 +397,7 @@ impl Writes {
 /// Finds the cell receiving object pushes from the most probes. Requires at least two probes;
 /// this cell holds pending-work descriptors.
 fn pending_cell(probes: &[Writes]) -> Option<u32> {
-    let mut pushers: HashMap<u32, usize> = HashMap::new();
+    let mut pushers: HashMap<u32, usize> = HashMap::default();
     for writes in probes {
         let cells: HashSet<u32> = writes.pushes.iter().map(|push| push.cell).collect();
         for cell in cells {
@@ -413,7 +414,7 @@ fn pending_cell(probes: &[Writes]) -> Option<u32> {
 /// and its branches first, entering functions called at their creation sites. Then visits
 /// created callbacks in creation order. Treats exception handlers as callbacks.
 fn trace_writes(index: &Index<'_>, entry: u32, dispatcher: &RangeInclusive<u32>) -> Writes {
-    let mut stores: HashMap<u32, Vec<&query::Store>> = HashMap::new();
+    let mut stores: HashMap<u32, Vec<&query::Store>> = HashMap::default();
     for store in index.stores() {
         stores.entry(store.pc).or_default().push(store);
     }
@@ -421,8 +422,8 @@ fn trace_writes(index: &Index<'_>, entry: u32, dispatcher: &RangeInclusive<u32>)
     let mut in_body = true;
     let mut callbacks = VecDeque::from([entry]);
     // The functions this body created that registers still hold.
-    let mut closures: HashMap<u8, u32> = HashMap::new();
-    let mut reached = HashSet::new();
+    let mut closures: HashMap<u8, u32> = HashMap::default();
+    let mut reached = HashSet::default();
     while let Some(start) = callbacks.pop_front() {
         let mut unvisited = vec![start];
         while let Some(pc) = unvisited.pop() {

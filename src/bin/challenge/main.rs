@@ -14,6 +14,11 @@ use tokio::runtime::Builder;
 use crate::cli::Entry;
 use crate::io::Artifacts;
 
+/// Keeps the deobfuscator's syntax tree contiguous in memory (see [`cfsolve::Allocator`]).
+#[global_allocator]
+static ALLOCATOR: cfsolve::Allocator<std::alloc::System> =
+    cfsolve::Allocator::new(std::alloc::System);
+
 fn main() -> Result<()> {
     let Some(arguments) = cli::parse(env::args_os().skip(1))? else {
         println!("{}", cli::USAGE);

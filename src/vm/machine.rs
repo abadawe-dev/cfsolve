@@ -1,5 +1,7 @@
 //! A session's VM, found in its script and ready to decode instructions.
 
+use std::cell::Cell;
+
 use anyhow::Result;
 use swc_core::ecma::ast::{BlockStmt, Class, Script, Stmt};
 
@@ -55,6 +57,9 @@ pub(super) struct Loaded<'program, 'definition> {
     program: &'program [u8],
     pub(super) fields: HashMap<String, Value<'definition>>,
     decrypted: Decrypted<'definition>,
+    /// The last position decoded. A hidden branch's compare is run once per candidate string,
+    /// and the opcode there depends only on the program and the position.
+    last_decoded: Cell<Option<(u32, u8, Decoded)>>,
 }
 
 impl<'definition> Machine<'definition> {
@@ -72,6 +77,7 @@ impl<'definition> Machine<'definition> {
             program,
             fields: self.session.constructed(program),
             decrypted: Decrypted::default(),
+            last_decoded: Cell::new(None),
         }
     }
 
@@ -132,11 +138,19 @@ impl<'definition> Machine<'definition> {
         if pc as usize >= loaded.program.len() {
             return Err(fail(Cause::PastEnd));
         }
-        let Decoded { opcode, key: next } = self
-            .definition
-            .dispatch
-            .decode(&self.session, loaded.program, pc, key)
-            .map_err(|reason| fail(Cause::Undecoded { reason }))?;
+        let decoded = match loaded.last_decoded.get() {
+            Some((at, with, decoded)) if at == pc && with == key => decoded,
+            _ => {
+                let decoded = self
+                    .definition
+                    .dispatch
+                    .decode(&self.session, loaded.program, pc, key)
+                    .map_err(|reason| fail(Cause::Undecoded { reason }))?;
+                loaded.last_decoded.set(Some((pc, key, decoded)));
+                decoded
+            }
+        };
+        let Decoded { opcode, key: next } = decoded;
         let handler = self
             .session
             .handlers

@@ -5,6 +5,11 @@ use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
 
+/// Keeps the deobfuscator's syntax tree contiguous in memory (see [`cfsolve::Allocator`]).
+#[global_allocator]
+static ALLOCATOR: cfsolve::Allocator<std::alloc::System> =
+    cfsolve::Allocator::new(std::alloc::System);
+
 fn main() -> Result<()> {
     let arguments: Vec<PathBuf> = env::args_os().skip(1).map(PathBuf::from).collect();
     let [input, output] = &arguments[..] else {

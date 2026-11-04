@@ -10,14 +10,14 @@ use swc_core::ecma::ast::{
 use swc_core::ecma::visit::{Visit, VisitWith};
 
 use super::Bindings;
-use crate::deobfuscate::{HashMap, HashSet};
+use crate::deobfuscate::{HashMap, HashSet, IdMap, IdRef};
 use crate::js::ast;
 
 /// Tracks property uses by binding and by object. Merges uses through single-assignment copies
 /// such as `alias = object`; the copies themselves do not count as uses. See
 /// [`Bindings::root`].
 pub(crate) struct Properties {
-    uses: HashMap<Id, Uses>,
+    uses: IdMap<Uses>,
     /// The uses of each root, merged over every binding with that root.
     objects: HashMap<Id, Uses>,
     /// See [`Bindings::roots`].
@@ -87,14 +87,15 @@ impl Uses {
 
 impl Properties {
     #[must_use]
-    pub(crate) fn collect(program: &Program, bindings: &Bindings) -> Self {
+    pub(crate) fn collect(program: &Program, bindings: &Bindings, size: usize) -> Self {
         let mut collect = Collect {
             bindings,
-            uses: HashMap::default(),
+            uses: IdMap::with_capacity_and_hasher(size, Default::default()),
         };
         program.visit_with(&mut collect);
         let uses = collect.uses;
-        let mut objects: HashMap<Id, Uses> = HashMap::default();
+        let mut objects: HashMap<Id, Uses> =
+            HashMap::with_capacity_and_hasher(uses.len(), Default::default());
         for (id, uses) in &uses {
             objects.entry(bindings.root(id)).or_default().merge(uses);
         }
@@ -104,6 +105,12 @@ impl Properties {
             roots: bindings.roots(),
             none: Uses::default(),
         }
+    }
+
+    /// How many bindings have uses, which the next collection starts from.
+    #[must_use]
+    pub(crate) fn size(&self) -> usize {
+        self.uses.len()
     }
 
     /// The uses through `id` itself.
@@ -158,12 +165,12 @@ enum Access {
 
 struct Collect<'bindings> {
     bindings: &'bindings Bindings,
-    uses: HashMap<Id, Uses>,
+    uses: IdMap<Uses>,
 }
 
 impl Collect<'_> {
     fn uses(&mut self, id: &Ident) -> &mut Uses {
-        self.uses.entry(id.to_id()).or_default()
+        self.uses.entry_ref(&IdRef::from(id)).or_default()
     }
 
     /// Records an `access` to `member` when its object is a binding, then visits the remaining
@@ -352,6 +359,10 @@ const PROTO: &str = "__proto__";
 /// them with U+FFFD and could match a different key.
 #[must_use]
 pub(crate) fn member_key(property: &MemberProp) -> Option<Atom> {
+    // The common case already holds the name as an atom.
+    if let MemberProp::Ident(name) = property {
+        return (name.sym != PROTO).then(|| name.sym.clone());
+    }
     ast::member_str(property)
         .filter(|name| *name != PROTO)
         .map(Atom::from)
@@ -392,7 +403,7 @@ mod tests {
     use crate::js::ast;
 
     fn properties(program: &Program) -> Properties {
-        Properties::collect(program, &Bindings::collect(program))
+        Properties::collect(program, &Bindings::collect(program, Default::default()), 0)
     }
 
     fn member(source: &str) -> MemberProp {

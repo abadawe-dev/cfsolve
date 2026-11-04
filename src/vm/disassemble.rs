@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
+use std::mem;
 use std::ops::ControlFlow;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -17,7 +18,7 @@ use std::thread::{self, ScopedJoinHandle};
 
 use anyhow::{Result, bail};
 use indexmap::IndexSet;
-use rustc_hash::{FxBuildHasher, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use swc_core::ecma::ast::BinaryOp;
 
 use super::interpret::Way;
@@ -95,8 +96,56 @@ struct Decoders<'scope> {
 
 /// What decoding one position gave, or why a worker could not start.
 enum Decoded {
-    Instruction(Result<Instruction, Failure>),
+    Instruction(Result<Read, Failure>),
     Unavailable(anyhow::Error),
+}
+
+/// A decoded instruction and the shortcuts of the hidden branches it may hold, worked out with it
+/// because they too read only the program and the machine.
+struct Read {
+    instruction: Instruction,
+    shortcuts: Vec<(u8, Option<Shortcut>)>,
+}
+
+impl Read {
+    fn at<'a>(
+        machine: &Machine<'a>,
+        loaded: &Loaded<'_, 'a>,
+        position: Position,
+    ) -> Result<Self, Failure> {
+        let instruction = machine.decode(loaded, position.pc, position.key, &[])?;
+        let (pc, key) = (instruction.pc, instruction.key);
+        let shortcuts = compared_registers(&instruction)
+            .into_iter()
+            .map(|register| {
+                let shortcut = Shortcut::learn(machine, loaded, pc, key, register);
+                (register, shortcut)
+            })
+            .collect();
+        Ok(Self {
+            instruction,
+            shortcuts,
+        })
+    }
+}
+
+/// The registers `instruction` compares with control flow the interpreter cannot resolve, which
+/// may hide a branch.
+fn compared_registers(instruction: &Instruction) -> BTreeSet<u8> {
+    let mut registers = BTreeSet::new();
+    let unfollowed = instruction
+        .paths
+        .iter()
+        .filter(|path| matches!(path.exit, Exit::Unfollowed { .. }))
+        .flat_map(|path| &path.conditions);
+    for (condition, _) in unfollowed {
+        condition.visit(&mut |term| {
+            if let Term::Reg(register) = term {
+                registers.insert(*register);
+            }
+        });
+    }
+    registers
 }
 
 #[derive(Default)]
@@ -223,14 +272,11 @@ impl<'scope> Decoders<'scope> {
                     };
                     let loaded = machine.load(program);
                     while let Some(position) = queue.wait() {
-                        let instruction = machine.decode(&loaded, position.pc, position.key, &[]);
-                        if let Ok(instruction) = &instruction {
-                            queue.look_ahead(instruction);
+                        let read = Read::at(&machine, &loaded, position);
+                        if let Ok(read) = &read {
+                            queue.look_ahead(&read.instruction);
                         }
-                        if sender
-                            .send((position, Decoded::Instruction(instruction)))
-                            .is_err()
-                        {
+                        if sender.send((position, Decoded::Instruction(read))).is_err() {
                             return;
                         }
                     }
@@ -257,7 +303,7 @@ impl<'scope> Decoders<'scope> {
         // The walk's positions in the order it reached them, and the instructions decoded
         // before the walk needed them.
         let mut order: VecDeque<Position> = VecDeque::new();
-        let mut decoded: HashMap<Position, Result<Instruction, Failure>> = HashMap::default();
+        let mut decoded: HashMap<Position, Result<Read, Failure>> = HashMap::default();
         let reach = |walk: &mut Walk, order: &mut VecDeque<Position>| {
             let reached: Vec<Position> = walk.queue.drain(..).collect();
             self.queue.reach(reached.iter().copied());
@@ -296,7 +342,7 @@ impl<'scope> Decoders<'scope> {
                 }
             };
             match instruction {
-                Ok(instruction) => walk.add(machine, loaded, instruction)?,
+                Ok(read) => walk.add(read)?,
                 Err(failure) => walk.listing.failures.push(failure),
             }
             // A hidden branch is revealed by a probe and a candidate string; its code often
@@ -316,12 +362,12 @@ impl<'scope> Decoders<'scope> {
         machine: &Machine<'a>,
         loaded: &Loaded<'_, 'a>,
         position: Position,
-    ) -> Result<Instruction, Failure> {
-        let instruction = machine.decode(loaded, position.pc, position.key, &[]);
-        if let Ok(instruction) = &instruction {
-            self.queue.look_ahead(instruction);
+    ) -> Result<Read, Failure> {
+        let read = Read::at(machine, loaded, position);
+        if let Ok(read) = &read {
+            self.queue.look_ahead(&read.instruction);
         }
-        instruction
+        read
     }
 }
 
@@ -382,9 +428,12 @@ struct Probe {
     key: u8,
     /// Where the compare goes when the string does not match.
     fallthrough: Option<Position>,
-    /// How many of [`Walk::candidates`] it has been tried with.
+    /// How many of [`Walk::candidates`] it has been offered.
     tried: usize,
     shortcut: Option<Shortcut>,
+    /// Indices of the candidates its shortcut ruled out rather than ran. Dropping the shortcut
+    /// runs these; the others already ran and revealed nothing.
+    skipped: Vec<usize>,
 }
 
 impl Walk {
@@ -409,42 +458,27 @@ impl Walk {
         }
     }
 
-    fn add<'a>(
-        &mut self,
-        machine: &Machine<'a>,
-        loaded: &Loaded<'_, 'a>,
-        instruction: Instruction,
-    ) -> Result<()> {
+    fn add(&mut self, read: Read) -> Result<()> {
+        let Read {
+            instruction,
+            shortcuts,
+        } = read;
         self.from = Some(instruction.pc);
         for path in &instruction.paths {
             self.follow(path)?;
-        }
-        // A comparison with register-dependent control flow that the interpreter cannot resolve
-        // may hide a branch.
-        let mut registers = BTreeSet::new();
-        let unfollowed = instruction
-            .paths
-            .iter()
-            .filter(|path| matches!(path.exit, Exit::Unfollowed { .. }))
-            .flat_map(|path| &path.conditions);
-        for (condition, _) in unfollowed {
-            condition.visit(&mut |term| {
-                if let Term::Reg(register) = term {
-                    registers.insert(*register);
-                }
-            });
         }
         let fallthrough = instruction
             .paths
             .iter()
             .find_map(|path| path.exit.continues_at());
         let (pc, key) = (instruction.pc, instruction.key);
-        for register in registers {
+        for (register, shortcut) in shortcuts {
             let probe = Probe {
                 key,
                 fallthrough,
                 tried: 0,
-                shortcut: Shortcut::learn(machine, loaded, pc, key, register),
+                shortcut,
+                skipped: Vec::new(),
             };
             self.probes.insert((pc, register), probe);
             self.found += 1;
@@ -492,12 +526,22 @@ impl Walk {
                     self.hashes.entry(shortcut.field.clone()).or_default(),
                 )
             });
-            for candidate in self.candidates.iter().skip(probe.tried) {
+            // Once its shortcut is dropped, a probe runs the candidates that ruled out, which come
+            // before any it has not been offered.
+            let skipped = if shortcut.is_none() {
+                mem::take(&mut probe.skipped)
+            } else {
+                Vec::new()
+            };
+            let unseen = probe.tried..self.candidates.len();
+            for index in skipped.into_iter().chain(unseen) {
+                let candidate = &self.candidates[index];
                 if let Some((shortcut, hashes)) = &shortcut
                     && hashes
                         .get(candidate)
                         .is_some_and(|&hash| hash != shortcut.expected)
                 {
+                    probe.skipped.push(index);
                     continue;
                 }
                 let known = [(register, Value::string(candidate))];
@@ -549,7 +593,6 @@ impl Walk {
         let mut dropped = false;
         for probe in self.probes.values_mut() {
             if probe.shortcut.take().is_some() {
-                probe.tried = 0;
                 dropped = true;
             }
         }
@@ -695,12 +738,14 @@ fn fuse_method_calls(listing: &mut Listing) {
     // Unrecorded entries, such as functions and hidden targets, start with no known loads.
     let functions = listing.functions.iter().map(|function| function.pc);
     let hidden = listing.hidden.iter().map(|hidden| hidden.target.pc);
-    let incoming = incoming_loads(listing, functions.chain(hidden));
     // Exception continuations also start with no known loads, without erasing the normal path's.
-    let exceptional = incoming_loads(listing, exception_entries(listing));
-    for (pc, instruction) in &mut listing.instructions {
-        let Some(entry) = incoming.get(pc).or_else(|| exceptional.get(pc)) else {
-            continue;
+    let (incoming, exceptional) = both(
+        || incoming_loads(listing, functions.chain(hidden)),
+        || incoming_loads(listing, exception_entries(listing)),
+    );
+    for_each_instruction(listing, |pc, instruction| {
+        let Some(entry) = incoming.get(&pc).or_else(|| exceptional.get(&pc)) else {
+            return;
         };
         for path in &mut instruction.paths {
             let mut loads = entry.clone();
@@ -711,14 +756,49 @@ fn fuse_method_calls(listing: &mut Listing) {
                 update_loads(&mut loads, effect);
             }
         }
-    }
+    });
+}
+
+/// Runs two analyses of a finished listing side by side.
+pub(super) fn both<A: Send, B: Send>(
+    first: impl FnOnce() -> A + Send,
+    second: impl FnOnce() -> B,
+) -> (A, B) {
+    thread::scope(|scope| {
+        let first = scope.spawn(first);
+        let second = second();
+        let first = first
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (first, second)
+    })
+}
+
+/// Rewrites each instruction of a finished listing on its own, on as many threads as decoding
+/// uses. Only what a rewrite is given can affect it, so the threads cannot change the result.
+pub(super) fn for_each_instruction(
+    listing: &mut Listing,
+    work: impl Fn(u32, &mut Instruction) + Sync,
+) {
+    let mut instructions: Vec<_> = listing.instructions.iter_mut().collect();
+    let size = instructions.len().div_ceil(decoding_threads() + 1).max(1);
+    thread::scope(|scope| {
+        for chunk in instructions.chunks_mut(size) {
+            let work = &work;
+            scope.spawn(move || {
+                for (pc, instruction) in chunk {
+                    work(**pc, instruction);
+                }
+            });
+        }
+    });
 }
 
 /// The loads known on entry to each instruction reachable from `entries`.
 fn incoming_loads(
     listing: &Listing,
     entries: impl IntoIterator<Item = u32>,
-) -> BTreeMap<u32, Loads> {
+) -> FxHashMap<u32, Loads> {
     let entries = entries.into_iter().map(|pc| (pc, Loads::default()));
     let ControlFlow::Continue(incoming) = dataflow::forward(listing, entries, |_, path, loads| {
         for effect in &path.effects {

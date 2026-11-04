@@ -2,7 +2,9 @@
 //! build; records are built with those names and renamed for the session afterward. Structural
 //! recognizers read the current listing directly.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
+
+use rustc_hash::FxHashSet as HashSet;
 
 use crate::listing::{self, Index};
 use crate::stage2::records::WriteOrder;

@@ -15,6 +15,7 @@ pub(super) mod names;
 mod properties;
 
 pub(super) use bindings::Bindings;
+use bindings::Size;
 pub(super) use globals::Globals;
 pub(super) use properties::{Properties, constant_index, member_key, prop_key};
 
@@ -25,6 +26,9 @@ pub(crate) struct Analysis {
     pub(crate) globals: Globals,
     bindings: Option<Bindings>,
     properties: Option<Properties>,
+    /// How large the last collections came out, which the next ones start from.
+    size: Size,
+    uses: usize,
 }
 
 impl Analysis {
@@ -34,28 +38,38 @@ impl Analysis {
             globals: Globals::new(unresolved_mark),
             bindings: None,
             properties: None,
+            size: Size::default(),
+            uses: 0,
         }
     }
 
     #[must_use]
     pub(crate) fn bindings(&mut self, program: &Program) -> &Bindings {
+        let size = self.size;
         self.bindings
-            .get_or_insert_with(|| Bindings::collect(program))
+            .get_or_insert_with(|| Bindings::collect(program, size))
     }
 
     /// Returns binding and property summaries; property uses build on the bindings.
     #[must_use]
     pub(crate) fn properties(&mut self, program: &Program) -> (&Bindings, &Properties) {
+        let (size, uses) = (self.size, self.uses);
         let bindings = self
             .bindings
-            .get_or_insert_with(|| Bindings::collect(program));
+            .get_or_insert_with(|| Bindings::collect(program, size));
         let properties = self
             .properties
-            .get_or_insert_with(|| Properties::collect(program, bindings));
+            .get_or_insert_with(|| Properties::collect(program, bindings, uses));
         (bindings, properties)
     }
 
     pub(crate) fn invalidate(&mut self) {
+        if let Some(bindings) = &self.bindings {
+            self.size = bindings.size();
+        }
+        if let Some(properties) = &self.properties {
+            self.uses = properties.size();
+        }
         self.bindings = None;
         self.properties = None;
     }
