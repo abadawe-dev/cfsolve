@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::sessions;
-use crate::{http, performance_clock};
+use crate::performance_clock;
 
 /// The directory beside `traffic.json` holding kept response bodies.
 const BODIES: &str = "bodies";
@@ -35,13 +35,13 @@ pub(super) struct Connection {
     pub(super) h2_opening: Option<String>,
 }
 
-/// A request on an intercepted connection. hyper preserves header order, groups repeated values
-/// at the first occurrence of their name, and lowercases names as HTTP/2 does.
+/// A request the browser sent, with its headers in the order sent. The proxy's hyper groups
+/// repeated values at the first occurrence of their name, and lowercases names as HTTP/2 does.
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Request {
-    /// Index of this request's connection in `connections`.
-    connection: usize,
+    /// Index of this request's connection in `connections`, when the proxy terminated it.
+    connection: Option<usize>,
     pub(super) method: String,
     pub(super) url: String,
     version: String,
@@ -65,20 +65,20 @@ impl Traffic {
     }
 
     /// Records a request received now and returns the index used by [`Self::answered`].
-    pub(super) fn request<B>(
+    pub(super) fn request(
         &mut self,
-        connection: usize,
+        connection: Option<usize>,
+        method: &str,
         url: &str,
-        request: &hyper::Request<B>,
+        version: &str,
+        headers: Vec<(String, String)>,
     ) -> usize {
         self.requests.push(Request {
             connection,
-            method: request.method().to_string(),
+            method: method.to_owned(),
             url: url.to_owned(),
-            version: format!("{:?}", request.version()),
-            headers: http::text_headers(request.headers())
-                .map(|(name, value)| (name.to_owned(), value))
-                .collect(),
+            version: version.to_owned(),
+            headers,
             received_ms: performance_clock::epoch_ms(),
             answered_ms: None,
             body_file: None,
@@ -120,7 +120,7 @@ impl Request {
     #[cfg(test)]
     pub(super) fn received(method: &str, url: &str, headers: Vec<(String, String)>) -> Self {
         Self {
-            connection: 0,
+            connection: Some(0),
             method: method.to_owned(),
             url: url.to_owned(),
             version: "HTTP/2.0".to_owned(),
@@ -148,9 +148,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("traffic-bodies-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let mut traffic = Traffic::default();
-        let request = hyper::Request::new(());
-        let page = traffic.request(0, "https://example.com/", &request);
-        let script = traffic.request(0, "https://example.com/v1", &request);
+        let request = |traffic: &mut Traffic, url| {
+            traffic.request(Some(0), "GET", url, "HTTP/2.0", Vec::new())
+        };
+        let page = request(&mut traffic, "https://example.com/");
+        let script = request(&mut traffic, "https://example.com/v1");
         traffic.keep(script, "orchestrator.js", b"script".to_vec());
         let log: serde_json::Value =
             serde_json::from_slice(&fs::read(traffic.write(&dir).unwrap()).unwrap()).unwrap();
