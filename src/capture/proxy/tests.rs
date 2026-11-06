@@ -281,7 +281,7 @@ async fn mitm_rewrites_iframes_and_rewraps_posts() {
             ["host", host], ["content-type", "text/plain;charset=UTF-8"], ["cf-chl", "tok456"],
             ["content-length", browser_body.len().to_string()], ["connection", "close"],
         ],
-        "receivedMs": post["receivedMs"], "answeredMs": post["answeredMs"],
+        "ordered": true, "receivedMs": post["receivedMs"], "answeredMs": post["answeredMs"],
     });
     assert_eq!(*post, expected);
 

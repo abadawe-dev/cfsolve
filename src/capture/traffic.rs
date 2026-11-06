@@ -46,6 +46,10 @@ pub(super) struct Request {
     pub(super) url: String,
     version: String,
     pub(super) headers: Vec<(String, String)>,
+    /// Whether `headers` are in the order sent. A browser's own interception reports them
+    /// without it (the DevTools protocol lists them by name).
+    #[serde(default = "in_order")]
+    pub(super) ordered: bool,
     /// Time received, in milliseconds since the Unix epoch.
     pub(super) received_ms: i64,
     /// Time the response was handed to the browser.
@@ -71,14 +75,19 @@ impl Traffic {
         method: &str,
         url: &str,
         version: &str,
-        headers: Vec<(String, String)>,
+        headers: SentHeaders,
     ) -> usize {
+        let (headers, ordered) = match headers {
+            SentHeaders::InOrder(headers) => (headers, true),
+            SentHeaders::Unordered(headers) => (headers, false),
+        };
         self.requests.push(Request {
             connection,
             method: method.to_owned(),
             url: url.to_owned(),
             version: version.to_owned(),
             headers,
+            ordered,
             received_ms: performance_clock::epoch_ms(),
             answered_ms: None,
             body_file: None,
@@ -115,6 +124,20 @@ impl Traffic {
     }
 }
 
+/// A request's headers, with their names lowercase.
+pub enum SentHeaders {
+    /// In the order the browser sent them, as the capture proxy receives them.
+    InOrder(Vec<(String, String)>),
+    /// Without their order, as a browser's own interception reports them. They time the
+    /// challenge POSTs, but teach no header order.
+    Unordered(Vec<(String, String)>),
+}
+
+/// Requests in logs written before the field existed came through the proxy.
+fn in_order() -> bool {
+    true
+}
+
 impl Request {
     /// Creates a request received at the current time on connection 0.
     #[cfg(test)]
@@ -125,6 +148,7 @@ impl Request {
             url: url.to_owned(),
             version: "HTTP/2.0".to_owned(),
             headers,
+            ordered: true,
             received_ms: performance_clock::epoch_ms(),
             answered_ms: None,
             body_file: None,
@@ -149,7 +173,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let mut traffic = Traffic::default();
         let request = |traffic: &mut Traffic, url| {
-            traffic.request(Some(0), "GET", url, "HTTP/2.0", Vec::new())
+            let headers = SentHeaders::InOrder(Vec::new());
+            traffic.request(Some(0), "GET", url, "HTTP/2.0", headers)
         };
         let page = request(&mut traffic, "https://example.com/");
         let script = request(&mut traffic, "https://example.com/v1");

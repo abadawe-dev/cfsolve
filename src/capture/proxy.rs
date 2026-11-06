@@ -29,7 +29,7 @@ use url::Url;
 use super::ca::CertificateAuthority;
 use super::head;
 use super::recorder::{Posted, Recorder};
-use super::traffic::Connection;
+use super::traffic::{Connection, SentHeaders};
 use super::upstream::{self, Stream, UpstreamProxy};
 use crate::challenge;
 use crate::http::{self, BrowserClient, Proxied};
@@ -293,6 +293,7 @@ impl CaptureProxy {
         let headers = http::text_headers(request.headers())
             .map(|(name, value)| (name.to_owned(), value))
             .collect();
+        let headers = SentHeaders::InOrder(headers);
         let version = format!("{:?}", request.version());
         let method = request.method().as_str();
         let logged = self

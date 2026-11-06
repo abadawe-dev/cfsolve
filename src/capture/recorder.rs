@@ -17,7 +17,7 @@ use url::Url;
 use super::recorded::Recording;
 use super::rsa::{self, ProxyKey};
 use super::sessions::{self, Iframe, Post, Sessions};
-use super::traffic::Traffic;
+use super::traffic::{SentHeaders, Traffic};
 use crate::challenge;
 use crate::deobfuscate;
 use crate::js::ast;
@@ -83,15 +83,16 @@ impl Recorder {
         self.traffic.lock().expect("the traffic log lock")
     }
 
-    /// Logs a request the browser sent now, with its headers in the order sent, on the proxy's
-    /// `connection` if it has one. Returns the index [`Self::answered`] takes.
+    /// Logs a request the browser sent now, on the proxy's `connection` if it has one. Returns
+    /// the index [`Self::answered`] takes. The challenge POSTs' times fill the profile's startup
+    /// and pending delays; headers in the order sent fill its header orders and identity.
     pub fn request(
         &self,
         connection: Option<usize>,
         method: &str,
         url: &str,
         version: &str,
-        headers: Vec<(String, String)>,
+        headers: SentHeaders,
     ) -> usize {
         self.traffic()
             .request(connection, method, url, version, headers)
@@ -311,7 +312,7 @@ mod tests {
             "POST",
             &post_url,
             "HTTP/2.0",
-            vec![("cf-chl".into(), "tok456".into())],
+            SentHeaders::Unordered(vec![("cf-chl".into(), "tok456".into())]),
         );
         recorder.answered(request);
         let recording = recorder.finish().await;
