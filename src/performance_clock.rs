@@ -100,7 +100,10 @@ impl PerformanceClock {
         let elapsed_us = now_us - self.origin_us;
         match self.resolution {
             Resolution::Chromium | Resolution::ChromiumFine => {
-                let interval_us = self.resolution.chromium_interval_us().expect("a Chromium clock");
+                let interval_us = self
+                    .resolution
+                    .chromium_interval_us()
+                    .expect("a Chromium clock");
                 clamp(now_us, interval_us) as f64 / 1000.0 - self.origin_us as f64 / 1000.0
             }
             Resolution::WebKitMillisecond => elapsed_us.div_euclid(1000) as f64,
@@ -268,7 +271,10 @@ mod tests {
     /// reports `0.004999995231628418` there, the step less the subtraction's rounding).
     #[test]
     fn back_to_back_readings_step_by_the_chromium_interval() {
-        for (resolution, step) in [(Resolution::Chromium, 0.1), (Resolution::ChromiumFine, 0.005)] {
+        for (resolution, step) in [
+            (Resolution::Chromium, 0.1),
+            (Resolution::ChromiumFine, 0.005),
+        ] {
             let readings = PerformanceClock::started_now(resolution).back_to_back(200_000);
             let smallest = readings
                 .iter()
