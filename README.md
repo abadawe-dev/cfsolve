@@ -205,6 +205,18 @@ implement `Sink` and set `options.sink` to `Some(Arc::new(your_sink))`.
 | `Error::Config` | Invalid profile or options. | No |
 | `Error::Unsupported` | Any other failure, such as a new challenge build or a page with no widget. | No |
 
+### Recording a browser you drive
+
+The `capture` feature records a real browser's challenge payloads through whatever
+intercepts its traffic, such as the DevTools protocol's `Fetch` domain, without the
+capture proxy. Hand a `capture::Recorder` the browser's requests (`request`, `answered`),
+each HTML document from `challenges.cloudflare.com` before the browser gets it
+(`rewrite_iframe`, which returns the document to deliver instead), and each POST that
+`is_challenge_post` names (`challenge_post`, whose rewrapped body goes to Cloudflare, then
+`answered_post` with the response). `finish` returns the `capture::Recording`, which
+`capture::fill_profile` and `Answers::capture` turn into a profile, as they do the proxy's
+captures.
+
 ## Contributions (new policy as of 2026-11-07)
 
 Thank you to everyone who has contributed via pull requests.  Unfortunately, there has been a very large volume of them, which I lack the time to meaningfully review.  For that reason I would encourage you to fork the project instead.  I will not be maintaining this a few weeks from now, so forking will become necessary regardless.  If you think an exception should be made in the mean time, please email me.
