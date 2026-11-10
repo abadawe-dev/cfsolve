@@ -20,7 +20,7 @@ use super::sessions::{self, Iframe, Post, Sessions};
 use super::traffic::{SentHeaders, Traffic};
 use crate::challenge;
 use crate::deobfuscate;
-use crate::js::ast;
+use crate::js::ast::ParsedScript;
 
 /// The host serving Turnstile iframes and receiving their challenge POSTs.
 pub const CHALLENGE_HOST: &str = "challenges.cloudflare.com";
@@ -108,9 +108,9 @@ impl Recorder {
     /// get that document unchanged.
     pub fn rewrite_iframe(&self, url: &str, html: &str) -> Result<RewrittenIframe> {
         let javascript = challenge::inline_javascript(html)?;
-        let parsed = ast::parse_javascript("iframe.js", &javascript)?;
-        let strings = deobfuscate::inline_strings(&parsed.script);
-        let alphabet = sessions::scan_alphabet(&parsed.script, &strings)?;
+        let parsed = ParsedScript::parse("iframe.js", &javascript)?;
+        let strings = deobfuscate::inline_strings(&javascript)?;
+        let alphabet = sessions::scan_alphabet(parsed.script().program, &strings)?;
         let (rewritten, real_modulus) =
             rsa::swap_modulus(html, &strings, &self.sessions.proxy_key.modulus)?;
         let session = self.sessions.open(Iframe {

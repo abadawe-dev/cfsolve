@@ -21,7 +21,6 @@ use crate::challenge::program::{PreparedSession, SessionEncoder};
 use crate::challenge::reduced_timing::{Entry, ResourceTiming};
 use crate::challenge::source::InitialRequest;
 use crate::challenge::state::{Intervals, ScriptState};
-use crate::deobfuscate::Decoding;
 use crate::embedding_page::challenge_page::WIDGET_HOST;
 use crate::embedding_page::extra_params::{self, ApiScript};
 use crate::embedding_page::page::{Params, RenderedPage};
@@ -125,10 +124,10 @@ pub(crate) fn first_payload(
 /// In Chrome captures, the program calls the callback inside its own exception handler. In iOS
 /// Safari captures, the loader finishes later and its timer calls the callback without a
 /// registered handler.
-pub(super) async fn render_sample(
+pub(super) fn render_sample(
     api: &ApiScript,
     challenge: &ChallengePage,
-    decoding: &Decoding,
+    javascript: &str,
     cases: &CaseOpcodes,
     widget: &WidgetProgram,
     engine: Engine,
@@ -136,8 +135,7 @@ pub(super) async fn render_sample(
     // The session script puts the page's inline script before the orchestrator.
     let (inline_lines, _) = engine::line_and_column(&challenge.javascript(""), Lines::Script);
     let guarded = engine == Engine::Chromium;
-    let geometry = call_stack::recover_method_call(decoding, cases, widget.render_call, guarded)
-        .await?
+    let geometry = call_stack::recover_method_call(javascript, cases, widget.render_call, guarded)?
         .rebased(inline_lines);
     let origin = ScriptPosition {
         url: challenge.orchestrator.to_string(),
@@ -158,14 +156,14 @@ pub(crate) async fn begin(
     challenge: ChallengePage,
     referrer_policy: ReferrerPolicy,
 ) -> Result<Begun> {
-    sink.artifact("page.html", challenge.html.as_bytes())?;
+    sink.save("page.html", challenge.html.as_bytes())?;
     let pacing = &page.orchestrator_pacing;
     let timer = Timer::start();
     let script = http::fetch_page_script(client, &challenge.orchestrator, &challenge.loading)
         .await
         .context("loading the orchestrator")?;
     let script_fetch = timer.overall(challenge.orchestrator.as_str(), script.len() as u64);
-    sink.artifact("orchestrator.js", script.as_bytes())?;
+    sink.save("orchestrator.js", script.as_bytes())?;
     // The orchestrator's header shows the site's icon as it starts. Deobfuscation runs on its
     // own thread meanwhile.
     let icon_url = challenge.url.join("/favicon.ico")?;
@@ -175,16 +173,13 @@ pub(crate) async fn begin(
         anyhow::Ok(timer.overall(icon_url.as_str(), icon.encoded_bytes))
     };
     let javascript = challenge.javascript(&script);
-    // The render call's stack is read from the script as decoded, which its own thread decodes
-    // meanwhile.
-    let decoding = Decoding::start(javascript.clone())?;
     sink.progress(&format!(
         "Fetched the {}-byte orchestrator; deobfuscating it with the page's options",
         script.len()
     ));
     let ((text, cases), icon) =
         tokio::try_join!(initial::deobfuscate(sink, javascript.clone()), icon)?;
-    sink.artifact("orchestrator.deobfuscated.js", text.as_bytes())?;
+    sink.save("orchestrator.deobfuscated.js", text.as_bytes())?;
     let source = Source::try_new(&text).context("parsing the deobfuscated orchestrator")?;
 
     let intervals = &pacing.intervals;
@@ -244,7 +239,7 @@ pub(crate) async fn begin(
         .context("the orchestrator's message table names no one language")?;
     let ray = first.program.request.ray()?;
     let rendered = embedding_page::challenge_page::render(&challenge, &loader, language, ray)?;
-    sink.artifact("rendered-page.html", rendered.as_bytes())?;
+    sink.save("rendered-page.html", rendered.as_bytes())?;
     let rendered = RenderedPage::render_explicit(
         &rendered,
         challenge.url.clone(),
@@ -264,13 +259,11 @@ pub(crate) async fn begin(
     match render_sample(
         &api,
         &challenge,
-        &decoding,
+        &javascript,
         &cases,
         &widget,
         client.engine(),
-    )
-    .await
-    {
+    ) {
         Ok(sample) => api.render_sample = sample,
         Err(error) => sink.progress(&format!(
             "Warning: the orchestrator's render call has no recovered stack, so the loader \
@@ -368,7 +361,7 @@ impl PrecursorSession {
             .await
             .context("loading the precursor script")?;
         let load = timer.overall(script.as_str(), source.len() as u64);
-        sink.artifact("precursor.js", source.as_bytes())?;
+        sink.save("precursor.js", source.as_bytes())?;
         sink.progress(&format!(
             "The orchestrator loaded the {}-byte precursor script instead of a widget; reporting \
              that it ran",
@@ -446,7 +439,7 @@ impl Orchestration {
             .as_ref()
             .unwrap_or(&self.challenge.url);
         let cleared = http::submit_form(client, referer, &form.action, &form.fields).await?;
-        sink.artifact("cleared.html", cleared.html.as_bytes())?;
+        sink.save("cleared.html", cleared.html.as_bytes())?;
         let challenged = ChallengePage::parse(&cleared.html, &cleared.url)?.is_some();
         let cookies = client.cookies(&cleared.url);
         let clearance = cookies

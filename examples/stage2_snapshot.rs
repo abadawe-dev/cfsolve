@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::{env, fs};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use cfsolve::challenge::program::PreparedSession;
@@ -42,9 +42,6 @@ fn main() -> Result<()> {
     // The click stack reads the dispatch cases off the original's own
     // deobfuscation, as the CLI does when it fetches the iframe.
     let (_, cases) = call_stack::deobfuscate_with_cases(original.clone())?;
-    // Stack recovery reads the original as decoded, on a thread of its own.
-    let decoding = cfsolve::Decoding::start(original.clone())?;
-    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     let loops = call_stack::dispatch_summary(&original, &cases);
     snapshot.insert("dispatch_loops".into(), record(loops));
     let analysis = program("response.decoded.txt")?
@@ -59,7 +56,7 @@ fn main() -> Result<()> {
             .context("the stack probe's calls have an unrecognized shape")
             .and_then(|calls| {
                 let resumed = call_stack::Resumption::WorkerMessage;
-                runtime.block_on(call_stack::recover_probe(&decoding, &cases, calls, resumed))
+                call_stack::recover_probe(&original, &cases, calls, resumed)
             })
             .map(|geometry| {
                 json!({
@@ -88,7 +85,7 @@ fn main() -> Result<()> {
                 "forwarded": state.forwarded,
             })
         }),
-        Err(error) => Err(anyhow::anyhow!("{error:#}")),
+        Err(error) => Err(anyhow!("{error:#}")),
     };
     snapshot.insert("first_payload".into(), record(first_payload));
     let installed = session.map(|session| {
@@ -110,12 +107,12 @@ fn main() -> Result<()> {
             .and_then(|listing| interaction::recover(&listing));
         if let Ok(plan) = &checkbox_program {
             let diagnostics = &plan.diagnostics;
-            let frames = runtime.block_on(call_stack::recover(
-                &decoding,
+            let frames = call_stack::recover(
+                &original,
                 &cases,
                 diagnostics.construct,
                 diagnostics.callback_arity,
-            ));
+            );
             snapshot.insert("callback_frames".into(), record(frames));
             if let Ok(options) = read("options.json") {
                 let queries = serde_json::from_str::<Options>(&options)

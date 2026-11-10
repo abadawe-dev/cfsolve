@@ -1,5 +1,5 @@
-//! Queries value sources, function reachability, and common program reads such as `Date.now()`,
-//! challenge options, and record timestamps.
+//! Queries value sources, function reachability, and common program reads such as `Date.now()`
+//! and the challenge options object.
 //!
 //! [`Index::register_before`] finds the nearest earlier instruction assigning a register and
 //! returns the first write from any of its paths. [`Index::assignment`] resolves each write
@@ -7,11 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result, ensure};
-use swc_core::ecma::ast::BinaryOp;
-
 use super::Index;
-use crate::candidates;
 use crate::vm::{Constant, Effect, Instruction, Listing, Term};
 
 /// A property write, `object.key = value` or `object[key] = value`. Dynamic keys resolve to the
@@ -235,14 +231,6 @@ impl Index<'_> {
             })
     }
 
-    /// The challenge option `term` reads at `pc`: `name` in `window._cf_chl_opt[name]`.
-    #[must_use]
-    pub(crate) fn option_read(&self, pc: u32, term: &Term) -> Option<String> {
-        let option = self.member(pc, term)?;
-        self.holds_options(option.pc, &option.object)
-            .then_some(option.key)
-    }
-
     /// Whether `term` holds `window._cf_chl_opt` at `pc`: a read of it, or a copy of the object
     /// the program has installed there, as `window._cf_chl_opt = window._cf_chl_opt || {}`
     /// does. [`Index::dereference`] follows only the last of that assignment's two paths, the
@@ -278,44 +266,12 @@ impl Index<'_> {
         }
         false
     }
-
-    /// Finds a record's start, finish, and duration stores. Uses the first `finished - started`
-    /// store in program order and the stores supplying its operands.
-    pub(crate) fn clock_marks<'s>(&self, stores: &[&'s Store]) -> Result<[&'s Store; 3]> {
-        // Where a value comes from, or the value itself when its assignment is unknown.
-        let source = |pc: u32, term: &Term| match self.dereference(pc, term) {
-            Some((at, term)) => (Some(at), term),
-            None => (None, term.clone()),
-        };
-        let (duration, finished, started) = stores
-            .iter()
-            .find_map(|store| match source(store.pc, &store.value) {
-                (Some(at), Term::Binary(BinaryOp::Sub, finished, started)) => {
-                    Some((*store, source(at, &finished), source(at, &started)))
-                }
-                _ => None,
-            })
-            .context("record duration field not found")?;
-        let writing = |operand: (Option<u32>, Term)| -> Vec<&'s Store> {
-            stores
-                .iter()
-                .copied()
-                .filter(|store| source(store.pc, &store.value) == operand)
-                .collect()
-        };
-        let started = candidates::exactly_one(writing(started), "record start mark")?;
-        let finished = candidates::exactly_one(writing(finished), "record finish mark")?;
-        ensure!(
-            started.key != finished.key,
-            "record needs two wall-clock marks"
-        );
-        Ok([started, finished, duration])
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stage2::queries::option_read;
     use crate::vm::{Exit, Path, Position};
 
     fn string(text: &str) -> Term {
@@ -375,8 +331,11 @@ mod tests {
         ]);
         let index = Index::new(&listing);
         assert!(index.holds_options(6, &Term::Reg(4)));
-        assert_eq!(index.option_read(6, &Term::Reg(5)).as_deref(), Some("ray"));
+        assert_eq!(
+            option_read(&index, 6, &Term::Reg(5)).as_deref(),
+            Some("ray")
+        );
         assert!(!index.holds_options(8, &Term::Reg(6)));
-        assert_eq!(index.option_read(8, &Term::Reg(7)), None);
+        assert_eq!(option_read(&index, 8, &Term::Reg(7)), None);
     }
 }

@@ -217,6 +217,10 @@ each HTML document from `challenges.cloudflare.com` before the browser gets it
 `capture::fill_profile` and `Answers::capture` turn into a profile, as they do the proxy's
 captures.
 
+## Contributions (new policy as of 2026-11-07)
+
+Thank you to everyone who has contributed via pull requests.  Unfortunately, there has been a very large volume of them, which I lack the time to meaningfully review.  For that reason I would encourage you to fork the project instead.  I will not be maintaining this a few weeks from now, so forking will become necessary regardless.  If you think an exception should be made in the mean time, please email me.
+
 ## License
 
 MIT, except for the patched dependencies in `vendor/`, which keep their own
