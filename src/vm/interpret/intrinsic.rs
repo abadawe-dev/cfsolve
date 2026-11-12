@@ -8,6 +8,7 @@ use oxc::ast::ast::{Function, NumericLiteral, ObjectProperty};
 use oxc::ast_visit::{Visit, walk};
 use oxc::semantic::ScopeFlags;
 
+use super::access::Key;
 use super::copies::Copies;
 use super::mix32::Mix32;
 use super::register_helpers::{self, Helper};
@@ -20,6 +21,11 @@ use crate::vm::{HashMap, extract};
 /// A native function equivalent to a script function.
 #[derive(Clone, Copy)]
 pub(crate) enum Intrinsic {
+    /// The register read accessor, returning a register's value directly. Unlike interpreting its
+    /// body, this reads registers whose tag is unknown this run.
+    ReadRegister,
+    /// The register write router, storing a value in a register directly.
+    WriteRegister,
     /// Bookkeeping on the interpreter's unmasked register file.
     Register(Helper),
     Mix32(Mix32),
@@ -41,8 +47,13 @@ pub(super) fn address(function: &Function<'_>) -> usize {
 pub(crate) fn intrinsics(session: &Session<'_>) -> Intrinsics {
     let mut intrinsics = Intrinsics::default();
     let script = session.script;
-    for function in session.functions.values() {
-        let intrinsic = if let Some(helper) = register_helpers::recognize(script, function) {
+    for (symbol, function) in &session.functions {
+        let intrinsic = if Some(*symbol) == session.read_accessor {
+            Intrinsic::ReadRegister
+        } else if session.write_accessors.contains(symbol) {
+            Intrinsic::WriteRegister
+        } else if let Some(helper) = register_helpers::recognize(&session.members, script, function)
+        {
             Intrinsic::Register(helper)
         } else if let Some(mixer) = Mix32::recognize(script, function) {
             Intrinsic::Mix32(mixer)
@@ -71,6 +82,21 @@ impl Intrinsic {
         arguments: &[Value<'ast>],
     ) -> Option<Value<'ast>> {
         let register = match self {
+            Self::ReadRegister => {
+                let [Value::Registers, index] = arguments else {
+                    return None;
+                };
+                let register = run.register(&Key::from(index.clone())).ok()?;
+                return Some(run.register_value(register));
+            }
+            Self::WriteRegister => {
+                let [Value::Registers, index, value] = arguments else {
+                    return None;
+                };
+                let register = run.register(&Key::from(index.clone())).ok()?;
+                run.write_register(register, value.clone());
+                return Some(value.clone());
+            }
             Self::Mix32(mixer) => {
                 let Some(Value::Number(number)) = arguments.first() else {
                     return None;

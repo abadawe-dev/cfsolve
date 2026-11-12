@@ -10,7 +10,7 @@ use oxc::syntax::operator::BinaryOperator;
 
 use super::mix32;
 use crate::js::ast::{self, Script};
-use crate::vm::registers::Member;
+use crate::vm::registers::{Member, Members};
 use crate::vm::{HashSet, extract};
 
 #[derive(Clone, Copy)]
@@ -21,7 +21,11 @@ pub(crate) enum Helper {
     Number,
 }
 
-pub(super) fn recognize(script: Script<'_>, function: &Function<'_>) -> Option<Helper> {
+pub(super) fn recognize(
+    members: &Members,
+    script: Script<'_>,
+    function: &Function<'_>,
+) -> Option<Helper> {
     if function.r#async || function.generator {
         return None;
     }
@@ -33,7 +37,7 @@ pub(super) fn recognize(script: Script<'_>, function: &Function<'_>) -> Option<H
     if !body.directives.is_empty() {
         return None;
     }
-    let recognizer = Recognizer { script };
+    let recognizer = Recognizer { script, members };
     let body = &body.statements;
     if let [value] = parameters[..]
         && let [
@@ -62,11 +66,18 @@ pub(super) fn recognize(script: Script<'_>, function: &Function<'_>) -> Option<H
     if object == value {
         return None;
     }
-    if let [
-        Statement::IfStatement(branch),
-        Statement::ReturnStatement(returned),
-    ] = &body[..]
-        && recognizer.returns(returned.argument.as_ref(), value)
+    // The setter is an `if`/`else` storing the value and its integer flag, optionally returning
+    // the value afterwards (some builds return it, others do not; the return is never used).
+    let setter_branch = match &body[..] {
+        [Statement::IfStatement(branch)] => Some(branch),
+        [Statement::IfStatement(branch), Statement::ReturnStatement(returned)]
+            if recognizer.returns(returned.argument.as_ref(), value) =>
+        {
+            Some(branch)
+        }
+        _ => None,
+    };
+    if let Some(branch) = setter_branch
         && recognizer.guard(&branch.test, &HashSet::from_iter([value]))
         && let Some(other) = &branch.alternate
         && let Some(first) = recognizer.setter(&branch.consequent, object, value)
@@ -95,6 +106,7 @@ fn constant(member: Member) -> bool {
 /// Resolves the helper's references in the script declaring it.
 struct Recognizer<'s> {
     script: Script<'s>,
+    members: &'s Members,
 }
 
 impl Recognizer<'_> {
@@ -106,7 +118,7 @@ impl Recognizer<'_> {
         if !mix32::is_symbol(self.script, member.object(), object) {
             return None;
         }
-        Member::of(ast::member_str(member)?)
+        self.members.of(ast::member_str(member)?)
     }
 
     fn target_member(&self, target: &AssignmentTarget<'_>, object: SymbolId) -> Option<Member> {
@@ -315,6 +327,7 @@ pub(super) mod tests {
         for value in values {
             let execute = |native| {
                 let mut session = Session::empty(script);
+                session.members = Members::legacy();
                 session.layout = Layout {
                     pc: 240,
                     key: 241,
@@ -358,7 +371,7 @@ pub(super) mod tests {
             "function f(b) { if (typeof b !== 'number') throw new TypeError; return b; }",
         ] {
             assert_native_matches_interpreted(source, |script, function| {
-                recognize(script, function).is_some()
+                recognize(&Members::legacy(), script, function).is_some()
             });
         }
     }
@@ -377,7 +390,7 @@ pub(super) mod tests {
             let parsed = ParsedScript::parse("t", source).expect("test sources parse");
             let script = parsed.script();
             for function in extract::functions(&script.program.body).values() {
-                assert!(recognize(script, function).is_none(), "{source}");
+                assert!(recognize(&Members::legacy(), script, function).is_none(), "{source}");
             }
         }
     }

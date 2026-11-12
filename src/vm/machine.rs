@@ -11,6 +11,7 @@ use super::dispatch::{Decoded, Dispatch};
 use super::extract::{self, RunMethod};
 use super::interpret::{self, Decrypted, Invocation, MAXIMUM_PATHS, NativeDispatch, Way};
 use super::output::{Cause, Failure, Instruction, Position};
+use super::registers::Derived;
 use super::session::Session;
 use super::value::Value;
 use crate::js::ast::Script;
@@ -25,6 +26,8 @@ pub struct Definition<'a> {
     /// Functions declared beside the class: handlers and their helpers.
     pub(super) functions: HashMap<SymbolId, &'a Function<'a>>,
     pub(super) run: RunMethod<'a>,
+    /// Register-file member roles and the read and write accessors, derived from structure.
+    pub(super) derived: Derived,
     dispatch: Dispatch<'a>,
 }
 
@@ -38,18 +41,21 @@ impl<'a> Definition<'a> {
     /// Finds the VM in `script`. Fails unless a class has a `run` method whose dispatch loop has
     /// the expected shape.
     pub(crate) fn from_script(script: Script<'a>) -> Result<Self> {
-        let (body, class) = extract::find(script).context("no VM class in the script")?;
-        let run = extract::method(class, "run").context("the VM class has no run method")?;
-        let functions = extract::functions(&body.statements);
-        let run = extract::run_method(script, &functions, run)?;
+        let found = extract::vm(script).context("no VM in the script")?;
+        let functions = extract::functions(&found.body.statements);
+        let register_class = extract::register_class(script)?;
+        let derived = super::registers::derive(script, &functions, register_class)
+            .context("recovering the register-file member roles")?;
+        let run = extract::run_method(script, &functions, found.run, found.receiver, &derived)?;
         let dispatch = Dispatch::from_loop(script, &run.dispatch)?;
         Ok(Self {
             script,
-            body,
-            class,
-            prelude: extract::prelude(script, body),
+            body: found.body,
+            class: found.class,
+            prelude: extract::prelude(script, found.body),
             functions,
             run,
+            derived,
             dispatch,
         })
     }

@@ -21,9 +21,9 @@ use super::extract::{self, RunMethod};
 use super::interpret::{self, Branching, Frozen, Intrinsics, Plans, Run, Spare, StringDecoder};
 use super::machine::Definition;
 use super::output::{Constant, Position, Term};
-use super::registers::Member;
+use super::registers::{Member, Members};
 use super::value::Value;
-use super::{HashMap, convert};
+use super::{HashMap, HashSet, convert};
 use crate::js::ast::{self, Binding, Script};
 
 pub(crate) struct Session<'ast> {
@@ -46,6 +46,12 @@ pub(crate) struct Session<'ast> {
     /// stops interpretation.
     pub unavailable: HashMap<Binding<'ast>, String>,
     pub layout: Layout,
+    /// Register-file member roles, derived from the accessor structure per build.
+    pub members: Members,
+    /// The register read accessor function, run natively (`registers.read`'s free-function form).
+    pub read_accessor: Option<SymbolId>,
+    /// The register write-router functions, run natively (`registers.write`'s free-function form).
+    pub write_accessors: HashSet<SymbolId>,
     /// Handler state: registers, register mask, and state-register indices.
     pub state: HashMap<String, Value<'ast>>,
     /// Initial register stacks created by the constructor for handler execution.
@@ -94,13 +100,18 @@ impl<'ast> Session<'ast> {
         } = definition;
         let constructor = extract::constructor(class)?;
         let handlers = extract::handlers(script, functions, &run.dispatch)?;
-        let record_decoder = extract::record_decoder(script, body)
-            .and_then(|symbol| functions.get(&symbol).copied());
+        let read = functions.get(&definition.derived.read).copied();
+        let record_decoder =
+            read.and_then(|read| extract::record_decoder(script, read))
+                .and_then(|symbol| functions.get(&symbol).copied());
         let mut session = Self {
             functions: functions.clone(),
             handlers,
             entry: extract::entry(body)?,
             record_decoder,
+            members: definition.derived.members.clone(),
+            read_accessor: Some(definition.derived.read),
+            write_accessors: definition.derived.writes.clone(),
             ..Self::unevaluated(script, constructor)
         };
         (session.bindings, session.unavailable) =
@@ -132,6 +143,9 @@ impl<'ast> Session<'ast> {
             bindings: HashMap::default(),
             unavailable: HashMap::default(),
             layout: Layout::default(),
+            members: Members::default(),
+            read_accessor: None,
+            write_accessors: HashSet::default(),
             state: HashMap::default(),
             program_key: None,
             symbol_fields: Vec::new(),
@@ -389,7 +403,7 @@ fn construct_assignment<'a>(
         // `registers.<index> = <copy of a field>`.
         _ => {
             let field = copied_field(script, &assign.right, copies);
-            match ast::member_str(target).and_then(Member::of) {
+            match ast::member_str(target).and_then(|name| run.members().of(name)) {
                 Some(Member::PcIndex) => constructed.pc = field,
                 Some(Member::KeyIndex) => constructed.key = field,
                 _ => {}

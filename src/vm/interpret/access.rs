@@ -105,7 +105,7 @@ impl<'ast> Run<'ast, '_> {
             Key::Value(value) => value.number(),
         };
         Ok(match object {
-            Value::Registers if let Some(member) = name.and_then(Member::of) => {
+            Value::Registers if let Some(member) = name.and_then(|name| self.members().of(name)) => {
                 self.register_member(member)
             }
             Value::Registers | Value::RegisterSlots(Slots::Values) => {
@@ -245,7 +245,7 @@ impl<'ast> Run<'ast, '_> {
     ) -> Evaluation<'ast, ()> {
         let layout = self.session.layout;
         match object {
-            Value::Registers => match key.text().and_then(Member::of) {
+            Value::Registers => match key.text().and_then(|name| self.members().of(name)) {
                 Some(Member::Pc | Member::OtherPc) => self.set_register(layout.pc, value),
                 Some(Member::Key | Member::OtherKey) => self.set_register(layout.key, value),
                 // These fields have fixed values in the interpreter model.

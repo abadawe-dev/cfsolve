@@ -161,7 +161,7 @@ impl<'ast> StringDecoder<'ast> {
         let decoder = session.record_decoder?;
         let script = session.script;
         let helpers = pattern::binary_helpers(session);
-        let captures = pattern::matches(&pattern::template(DECODER), script, decoder, &helpers)?;
+        let captures = pattern::matches(&pattern::template(DECODER), script, decoder, &helpers, &session.members)?;
         // Functions resolve through bindings first.
         let function = |binding: Binding<'ast>| {
             if session.bindings.contains_key(&binding) {
@@ -190,12 +190,13 @@ impl<'ast> StringDecoder<'ast> {
             return None;
         };
         let mac_captures =
-            pattern::matches(&pattern::template(MAC), script, mac_function, &helpers)?;
+            pattern::matches(&pattern::template(MAC), script, mac_function, &helpers, &session.members)?;
         let stream_captures = pattern::matches(
             &pattern::template(KEYSTREAM),
             script,
             keystream_function,
             &helpers,
+            &session.members,
         )?;
         if mac_captures.name("$self")? != mac
             || mac_captures.name("$compress")? != compress

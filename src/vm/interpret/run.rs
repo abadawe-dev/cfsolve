@@ -380,6 +380,11 @@ impl<'ast, 'session> Run<'ast, 'session> {
         self.session.script
     }
 
+    /// The register-file member roles of the session's VM.
+    pub(in crate::vm) fn members(&self) -> &'session crate::vm::registers::Members {
+        &self.session.members
+    }
+
     /// The path this run took, or why the handler rejected its operands.
     pub(super) fn finish(mut self, outcome: Evaluation<'ast, Value<'ast>>) -> Result<Path, String> {
         self.session.spare.replace(mem::take(&mut self.spare));

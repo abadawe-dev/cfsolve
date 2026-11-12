@@ -107,6 +107,7 @@ impl<'ast> NativeDispatch<'ast> {
                 decoder.function,
                 decoder.routine(),
                 &helpers,
+                &session.members,
             )
         };
         let (accumulates, captures) = match matched("key += position;") {
@@ -134,7 +135,7 @@ impl<'ast> NativeDispatch<'ast> {
         };
         let unmask = function(captures.name("$unmask")?)?;
         let unmask_captures =
-            pattern::matches(&pattern::template(UNMASK), script, unmask, &helpers)?;
+            pattern::matches(&pattern::template(UNMASK), script, unmask, &helpers, &session.members)?;
         // Inlined helpers also resolve as recognized, unless setup left them unavailable.
         let mut inlined = captures.helpers.iter().chain(&unmask_captures.helpers);
         if inlined.any(|binding| session.unavailable.contains_key(binding)) {

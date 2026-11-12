@@ -9,28 +9,105 @@ use oxc::ast::AstKind;
 use oxc::ast::ast::{
     Argument as CallArgument, AssignmentExpression, AssignmentTarget, BindingIdentifier,
     BindingPattern, CallExpression, Class, ClassElement, Expression, FormalParameters, Function,
-    FunctionBody, MemberExpression, MethodDefinitionKind, Statement, SwitchStatement,
+    FunctionBody, IdentifierReference, MemberExpression, MethodDefinitionKind, NewExpression,
+    Statement, SwitchStatement,
 };
 use oxc::ast_visit::{Visit, walk};
 use oxc::semantic::{ScopeFlags, SymbolId};
 use oxc::span::GetSpan;
 use oxc::syntax::operator::AssignmentOperator;
 
+use super::registers::Derived;
 use super::output::Position;
 use super::{HashMap, convert};
 use crate::candidates;
 use crate::js::ast::{self, Binding, Script};
 
-/// Finds a class with a `run` method and the innermost function body declaring it: the last such
-/// body in source order.
-pub(super) fn find<'a>(script: Script<'a>) -> Option<(&'a FunctionBody<'a>, &'a Class<'a>)> {
-    script
+/// How the program runner reaches the machine's `run`: as a method on the machine, or as a free
+/// function with the machine as its first argument. The two forms are the same machinery; which one
+/// a build uses is not a VM change.
+#[derive(Clone, Copy)]
+pub(super) enum Receiver {
+    /// `new Machine(p).run(...)`; the receiver is `this`.
+    This,
+    /// `run(new Machine(p), ...)`; the receiver is the run function's first parameter.
+    Param(SymbolId),
+}
+
+/// The VM a program runner installs: the enclosing function body, the machine class, its `run`
+/// function, and how `run` names the machine.
+pub(super) struct Found<'a> {
+    pub body: &'a FunctionBody<'a>,
+    pub class: &'a Class<'a>,
+    pub run: &'a Function<'a>,
+    pub receiver: Receiver,
+}
+
+/// Finds the VM the unique program runner installs.
+pub(super) fn vm<'a>(script: Script<'a>) -> Result<Found<'a>> {
+    let runner = Runner::find(script)?;
+    let class_symbol = script
+        .symbol(runner.machine_class)
+        .context("the program runner constructs a machine from no local class")?;
+    // The machine class is declared as a statement in the enclosing function body; take the
+    // innermost such body, as nested VMs may reuse names.
+    let (body, class) = script
         .functions()
         .filter_map(|function| {
             let body = function.body.as_deref()?;
-            Some((body, machine_class(body)?))
+            let class = body.statements.iter().find_map(|statement| match statement {
+                Statement::ClassDeclaration(class)
+                    if class.id.as_ref().map(BindingIdentifier::symbol_id) == Some(class_symbol) =>
+                {
+                    Some(&**class)
+                }
+                _ => None,
+            })?;
+            Some((body, class))
         })
         .last()
+        .context("the runner's machine class is declared in no function body")?;
+    let (run, receiver) = match runner.run {
+        RunCallee::Method => (
+            method(class, "run").context("the machine class has no run method")?,
+            Receiver::This,
+        ),
+        RunCallee::Free(name) => {
+            let symbol = script
+                .symbol(name)
+                .context("the run function is not a local")?;
+            let run = *functions(&body.statements)
+                .get(&symbol)
+                .context("the run function is not declared beside the machine class")?;
+            let machine = parameter(&run.params, 0)
+                .context("the run function takes no machine parameter")?;
+            (run, Receiver::Param(machine.symbol_id()))
+        }
+    };
+    Ok(Found {
+        body,
+        class,
+        run,
+        receiver,
+    })
+}
+
+/// The register-file class, recognized by its digest accessor (a getter or setter). Every build so
+/// far keeps the digest in a getter/setter pair, and no other VM class has accessors.
+pub(super) fn register_class<'a>(script: Script<'a>) -> Result<&'a Class<'a>> {
+    let classes = script.nodes.iter().filter_map(|node| match node.kind() {
+        AstKind::Class(class) if has_accessor(class) => Some(class),
+        _ => None,
+    });
+    candidates::exactly_one(classes, "register-file class")
+}
+
+/// Whether a class declares a getter or setter, other than in its constructor.
+fn has_accessor(class: &Class<'_>) -> bool {
+    class.body.body.iter().any(|element| {
+        matches!(element, ClassElement::MethodDefinition(method)
+            if matches!(method.kind, MethodDefinitionKind::Get | MethodDefinitionKind::Set))
+    })
 }
 
 /// Collects the statements that run before the VM's scope is entered, both at script level and
@@ -177,28 +254,35 @@ impl DispatchLoop<'_> {
     }
 }
 
-/// The locals of `run` and what they hold.
-struct Locals<'a> {
-    script: Script<'a>,
-    sources: HashMap<Binding<'a>, Source>,
-}
-
 /// Tracks assignments in `run`, including copies of register fields and indices, program counter
-/// and key setup, storing the third argument in the cells register, reading the program register,
+/// and key setup, storing the cells argument in the cells register, reading the program register,
 /// and calling dispatch loops. An unsupported assignment clears the known value of its local.
+///
+/// `run` is either the machine's `run` method (receiver `this`) or a free function taking the
+/// machine first (receiver that parameter); `receiver` says which, and `derived` names the register
+/// read and write accessors, which are free functions in current builds and methods in older ones.
 pub(super) fn run_method<'a>(
     script: Script<'a>,
     functions: &HashMap<SymbolId, &'a Function<'a>>,
     run: &'a Function<'a>,
+    receiver: Receiver,
+    derived: &Derived,
 ) -> Result<RunMethod<'a>> {
-    let body = run.body.as_deref().context("the run method has no body")?;
+    let body = run.body.as_deref().context("the run function has no body")?;
     let sources = (0..run.params.items.len())
         .filter_map(|index| {
             let name = parameter(&run.params, index)?;
             Some((Binding::Symbol(name.symbol_id()), Source::Parameter(index)))
         })
         .collect();
-    let mut locals = Locals { script, sources };
+    let mut locals = Locals {
+        script,
+        sources,
+        receiver,
+        read: derived.read,
+    };
+    // The cells array is the run function's last argument: the trailing `[]`.
+    let cells_argument = parameter_count(&run.params).checked_sub(1);
     let mut cells = None;
     let mut loaded = Vec::new();
     for statement in &body.statements {
@@ -210,11 +294,10 @@ pub(super) fn run_method<'a>(
             expression => vec![expression],
         };
         for expression in expressions {
-            if let Some((Source::Field(registers), arguments)) =
-                locals.method_call(expression, "write")
-                && let [Some(Source::Field(index)), Some(Source::Parameter(2))] = &arguments[..]
+            if let Some((registers, index)) =
+                cells_write(&locals, derived, expression, cells_argument)
             {
-                cells = Some((registers, index.clone()));
+                cells = Some((registers, index));
                 continue;
             }
             let Expression::AssignmentExpression(assignment) = expression else {
@@ -238,7 +321,7 @@ pub(super) fn run_method<'a>(
         }
     }
     let (registers, cells) =
-        cells.context("the run method writes its cells argument to no register")?;
+        cells.context("the run function writes its cells argument to no register")?;
     loaded.retain(|(file, index)| *file == registers && *index != cells);
     loaded.sort();
     loaded.dedup();
@@ -252,23 +335,29 @@ pub(super) fn run_method<'a>(
     let mut calls = DispatchCall {
         script,
         functions,
+        receiver,
         found: None,
     };
     calls.visit_function_body(body);
     let (function, call) = calls
         .found
-        .context("the run method calls no dispatch loop with the machine")?;
+        .context("the run function calls no dispatch loop with the machine")?;
     let arguments = call
         .arguments
         .iter()
-        .map(|argument| match ast::argument_expression(argument) {
-            Expression::ThisExpression(_) => Argument::Machine,
-            Expression::Identifier(name) => match locals.sources.get(&script.binding(name)) {
-                Some(Source::Field(field)) if *field == registers => Argument::Registers,
-                Some(Source::Register { index, .. }) if *index == program => Argument::Program,
+        .map(|argument| {
+            let expression = ast::argument_expression(argument);
+            if is_receiver(script, receiver, expression) {
+                return Argument::Machine;
+            }
+            match expression {
+                Expression::Identifier(name) => match locals.sources.get(&script.binding(name)) {
+                    Some(Source::Field(field)) if *field == registers => Argument::Registers,
+                    Some(Source::Register { index, .. }) if *index == program => Argument::Program,
+                    _ => Argument::Other,
+                },
                 _ => Argument::Other,
-            },
-            _ => Argument::Other,
+            }
         })
         .collect();
     Ok(RunMethod {
@@ -282,23 +371,67 @@ pub(super) fn run_method<'a>(
     })
 }
 
+/// Whether `expression` is the run function's receiver: `this`, or the machine parameter.
+fn is_receiver(script: Script<'_>, receiver: Receiver, expression: &Expression<'_>) -> bool {
+    match receiver {
+        Receiver::This => matches!(expression, Expression::ThisExpression(_)),
+        Receiver::Param(symbol) => script.refers_to(expression, symbol),
+    }
+}
+
+/// Recognizes `run` storing its cells argument in a register, as the method
+/// `<registers>.write(<index>, cells)` or the free-function `write(<registers>, <index>, cells)`.
+/// Returns the register-file field and the cells index field.
+fn cells_write<'a>(
+    locals: &Locals<'a>,
+    derived: &Derived,
+    expression: &Expression<'a>,
+    cells_argument: Option<usize>,
+) -> Option<(String, String)> {
+    let is_cells = |source: Option<&Source>| {
+        matches!(source, Some(Source::Parameter(index)) if Some(*index) == cells_argument)
+    };
+    if let Some((Source::Field(registers), arguments)) = locals.method_call(expression, "write")
+        && let [Some(Source::Field(index)), cells] = &arguments[..]
+        && is_cells(cells.as_ref())
+    {
+        return Some((registers, index.clone()));
+    }
+    let (callee, arguments) = ast::direct_call(expression)?;
+    let symbol = locals.script.symbol(callee)?;
+    if !derived.writes.contains(&symbol) {
+        return None;
+    }
+    let [file, index, value] = arguments else {
+        return None;
+    };
+    let source = |argument| locals.source(ast::argument_expression(argument));
+    match (source(file), source(index), source(value)) {
+        (Some(Source::Field(registers)), Some(Source::Field(index)), value)
+            if is_cells(value.as_ref()) =>
+        {
+            Some((registers, index))
+        }
+        _ => None,
+    }
+}
+
 /// Finds the first call in `run` whose first argument is the machine and whose target contains a
 /// dispatch switch.
 struct DispatchCall<'functions, 'a> {
     script: Script<'a>,
     functions: &'functions HashMap<SymbolId, &'a Function<'a>>,
+    receiver: Receiver,
     found: Option<(&'a Function<'a>, &'a CallExpression<'a>)>,
 }
 
 impl<'a> Visit<'a> for DispatchCall<'_, 'a> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if self.found.is_none()
-            && call.arguments.first().is_some_and(|first| {
-                matches!(
-                    ast::argument_expression(first),
-                    Expression::ThisExpression(_)
-                )
-            })
+            && call
+                .arguments
+                .first()
+                .is_some_and(|first| is_receiver(self.script, self.receiver, ast::argument_expression(first)))
             && let Expression::Identifier(callee) = &call.callee
             && let Some(symbol) = self.script.symbol(callee)
             && let Some(&function) = self.functions.get(&symbol)
@@ -311,6 +444,15 @@ impl<'a> Visit<'a> for DispatchCall<'_, 'a> {
         }
         walk::walk_call_expression(self, call);
     }
+}
+
+/// The locals of `run` and what they hold.
+struct Locals<'a> {
+    script: Script<'a>,
+    sources: HashMap<Binding<'a>, Source>,
+    receiver: Receiver,
+    /// The register read accessor, called as `read(<registers>, <index>)` in current builds.
+    read: SymbolId,
 }
 
 impl<'a> Locals<'a> {
@@ -333,18 +475,44 @@ impl<'a> Locals<'a> {
         match expression {
             Expression::Identifier(name) => self.sources.get(&self.script.binding(name)).cloned(),
             Expression::ParenthesizedExpression(paren) => self.source(&paren.expression),
-            Expression::CallExpression(_) => match self.method_call(expression, "read")? {
-                (Source::Field(registers), arguments) => match &arguments[..] {
-                    [Some(Source::Field(index))] => Some(Source::Register {
-                        registers,
-                        index: index.clone(),
-                    }),
-                    _ => None,
-                },
-                _ => None,
-            },
-            expression => Some(Source::Field(this_field(expression)?.to_owned())),
+            Expression::CallExpression(_) => self.register_read(expression),
+            expression => Some(Source::Field(self.receiver_field(expression)?.to_owned())),
         }
+    }
+
+    /// Recognizes a register read as the method `<registers>.read(<index>)` or the free-function
+    /// `read(<registers>, <index>)`.
+    fn register_read(&self, expression: &Expression<'a>) -> Option<Source> {
+        if let Some((Source::Field(registers), arguments)) = self.method_call(expression, "read")
+            && let [Some(Source::Field(index))] = &arguments[..]
+        {
+            return Some(Source::Register {
+                registers,
+                index: index.clone(),
+            });
+        }
+        let (callee, arguments) = ast::direct_call(expression)?;
+        if self.script.symbol(callee) != Some(self.read) {
+            return None;
+        }
+        let [file, index] = arguments else {
+            return None;
+        };
+        match (
+            self.source(ast::argument_expression(file)),
+            self.source(ast::argument_expression(index)),
+        ) {
+            (Some(Source::Field(registers)), Some(Source::Field(index))) => {
+                Some(Source::Register { registers, index })
+            }
+            _ => None,
+        }
+    }
+
+    /// The field `receiver.<field>` reads, where the receiver is `this` or the machine parameter.
+    fn receiver_field(&self, expression: &Expression<'a>) -> Option<&'a str> {
+        let member = expression.as_member_expression()?;
+        is_receiver(self.script, self.receiver, member.object()).then(|| ast::member_str(member))?
     }
 }
 
@@ -357,15 +525,16 @@ pub(super) fn this_field<'a>(expression: &Expression<'a>) -> Option<&'a str> {
     }
 }
 
-/// Finds the string decryption function called by the register reader as
-/// `decrypt(this.<values>[index])`.
+/// Finds the string decryption function the register `read` accessor calls as
+/// `decrypt(<registers>.<values>[index])`, where `registers` and `index` are `read`'s parameters.
 pub(super) fn record_decoder<'a>(
     script: Script<'a>,
-    body: &'a FunctionBody<'a>,
+    read: &'a Function<'a>,
 ) -> Option<SymbolId> {
-    /// Matches `<decoder>(this.<values>[<index>])`.
+    /// Matches `<decoder>(<registers>.<values>[<index>])`.
     struct Decoders<'a> {
         script: Script<'a>,
+        registers: SymbolId,
         index: SymbolId,
         found: Vec<Binding<'a>>,
     }
@@ -375,10 +544,9 @@ pub(super) fn record_decoder<'a>(
             if let Expression::Identifier(callee) = &call.callee
                 && let [argument] = &call.arguments[..]
                 && let Some(member) = ast::argument_expression(argument).as_member_expression()
-                && member
-                    .object()
-                    .as_member_expression()
-                    .is_some_and(|values| matches!(values.object(), Expression::ThisExpression(_)))
+                && member.object().as_member_expression().is_some_and(|values| {
+                    self.script.refers_to(values.object(), self.registers)
+                })
                 && let MemberExpression::ComputedMemberExpression(member) = member
                 && self.script.refers_to(&member.expression, self.index)
             {
@@ -388,18 +556,10 @@ pub(super) fn record_decoder<'a>(
         }
     }
 
-    let read = body
-        .statements
-        .iter()
-        .find_map(|statement| match statement {
-            Statement::ClassDeclaration(class) if method(class, "write").is_some() => {
-                method(class, "read")
-            }
-            _ => None,
-        })?;
     let mut decoders = Decoders {
         script,
-        index: parameter(&read.params, 0)?.symbol_id(),
+        registers: parameter(&read.params, 0)?.symbol_id(),
+        index: parameter(&read.params, 1)?.symbol_id(),
         found: Vec::new(),
     };
     decoders.visit_function(read, ScopeFlags::Function);
@@ -407,16 +567,6 @@ pub(super) fn record_decoder<'a>(
         return None;
     };
     Some(decoder)
-}
-
-/// The first class declaration with a `run` method.
-fn machine_class<'a>(body: &'a FunctionBody<'a>) -> Option<&'a Class<'a>> {
-    body.statements
-        .iter()
-        .find_map(|statement| match statement {
-            Statement::ClassDeclaration(class) if method(class, "run").is_some() => Some(&**class),
-            _ => None,
-        })
 }
 
 /// The method, getter, or setter named `name`, excluding the constructor.
@@ -523,11 +673,26 @@ pub(super) fn entry(body: &FunctionBody<'_>) -> Result<Position> {
     Ok(Position::new(pc, key))
 }
 
+/// How a runner body reaches `run`: as a method on the constructed machine, or as a free function
+/// taking the machine first. Recognized by role, so a build moving `run` out of the class is not a
+/// VM change.
+enum RunCallee<'ast> {
+    /// `new <Class>(p).run(pc, key, [])`.
+    Method,
+    /// `<run>(new <Class>(p), pc, key, [])`.
+    Free(&'ast IdentifierReference<'ast>),
+}
+
 /// The program runner, installed by
-/// `<global>.<name> = function(p) { return new <Class>(p).run(pc, key, []); }`.
+/// `<global>.<name> = function(p) { return <run>(new <Class>(p), pc, key, []); }` (free-function
+/// form) or `... return new <Class>(p).run(pc, key, []); ...` (method form).
 struct Runner<'ast> {
     /// The global property the runner is installed under. The name is random.
     name: &'ast str,
+    /// The class the runner constructs: the machine.
+    machine_class: &'ast IdentifierReference<'ast>,
+    /// How `run` is reached.
+    run: RunCallee<'ast>,
     /// Initial program counter from the source.
     pc: f64,
     /// Initial dispatch key from the source.
@@ -535,7 +700,7 @@ struct Runner<'ast> {
 }
 
 impl<'ast> Runner<'ast> {
-    fn installed_by(assignment: &AssignmentExpression<'ast>) -> Option<Self> {
+    fn installed_by(assignment: &'ast AssignmentExpression<'ast>) -> Option<Self> {
         let target = assignment.left.as_member_expression()?;
         if matches!(target.object(), Expression::Super(_)) {
             return None;
@@ -551,37 +716,75 @@ impl<'ast> Runner<'ast> {
         else {
             return None;
         };
-        let (machine, [pc, key, ..]) = ast::method_call(returned.argument.as_ref()?, "run")? else {
-            return None;
-        };
-        let (
-            Expression::NewExpression(_),
-            Expression::NumericLiteral(pc),
-            Expression::NumericLiteral(key),
-        ) = (
-            machine,
-            ast::argument_expression(pc),
-            ast::argument_expression(key),
-        )
-        else {
-            return None;
-        };
+        let name = ast::member_str(target)?;
+        let (machine_class, run, pc, key) = run_invocation(returned.argument.as_ref()?)?;
         Some(Self {
-            name: ast::member_str(target)?,
-            pc: pc.value,
-            key: key.value,
+            name,
+            machine_class,
+            run,
+            pc,
+            key,
         })
+    }
+
+    /// The single program runner the script installs.
+    fn find(script: Script<'ast>) -> Result<Self> {
+        let runners = script.nodes.iter().filter_map(|node| match node.kind() {
+            AstKind::AssignmentExpression(assignment) => Runner::installed_by(assignment),
+            _ => None,
+        });
+        candidates::exactly_one(runners, "program runner")
+    }
+}
+
+/// Reads a runner's returned `run` invocation: the machine class, how `run` is reached, and the
+/// initial program counter and dispatch key.
+fn run_invocation<'ast>(
+    returned: &'ast Expression<'ast>,
+) -> Option<(&'ast IdentifierReference<'ast>, RunCallee<'ast>, f64, f64)> {
+    // Method form: `new <Class>(p).run(pc, key, [])`.
+    if let Some((object, [pc, key, ..])) = ast::method_call(returned, "run")
+        && let Expression::NewExpression(new) = object
+    {
+        let (pc, key) = positions(ast::argument_expression(pc), ast::argument_expression(key))?;
+        return Some((new_class(new)?, RunCallee::Method, pc, key));
+    }
+    // Free-function form: `<run>(new <Class>(p), pc, key, [])`.
+    let Expression::CallExpression(call) = returned else {
+        return None;
+    };
+    let Expression::Identifier(run) = &call.callee else {
+        return None;
+    };
+    let [machine, pc, key, ..] = &call.arguments[..] else {
+        return None;
+    };
+    let Expression::NewExpression(new) = ast::argument_expression(machine) else {
+        return None;
+    };
+    let (pc, key) = positions(ast::argument_expression(pc), ast::argument_expression(key))?;
+    Some((new_class(new)?, RunCallee::Free(run), pc, key))
+}
+
+/// The two numeric literals of a runner's initial program counter and key.
+fn positions(pc: &Expression<'_>, key: &Expression<'_>) -> Option<(f64, f64)> {
+    match (pc, key) {
+        (Expression::NumericLiteral(pc), Expression::NumericLiteral(key)) => Some((pc.value, key.value)),
+        _ => None,
+    }
+}
+
+/// The class identifier a `new <Class>(...)` constructs.
+fn new_class<'ast>(new: &'ast NewExpression<'ast>) -> Option<&'ast IdentifierReference<'ast>> {
+    match &new.callee {
+        Expression::Identifier(class) => Some(class),
+        _ => None,
     }
 }
 
 /// Returns the installed program runner's name if exactly one exists (see [`Runner`]).
 pub(crate) fn runner_name(script: Script<'_>) -> Option<String> {
-    let runners = script.nodes.iter().filter_map(|node| match node.kind() {
-        AstKind::AssignmentExpression(assignment) => Runner::installed_by(assignment),
-        _ => None,
-    });
-    let runner = candidates::exactly_one(runners, "program runner").ok()?;
-    Some(runner.name.to_owned())
+    Runner::find(script).ok().map(|runner| runner.name.to_owned())
 }
 
 /// Whether `call` calls the runner `name` installs, as `name(...)` or `<global>.name(...)`.

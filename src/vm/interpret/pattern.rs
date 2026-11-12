@@ -48,6 +48,7 @@ use oxc::syntax::operator::{BinaryOperator, LogicalOperator};
 
 use super::formula::Formula;
 use super::plan::Routine;
+use crate::vm::registers::Members;
 use crate::js;
 use crate::js::ast::{Binding, ParsedScript, Script};
 use crate::vm::session::Session;
@@ -190,6 +191,7 @@ pub(super) fn matches<'a>(
     script: Script<'a>,
     function: &'a Function<'a>,
     helpers: &BinaryHelpers<'a>,
+    members: &Members,
 ) -> Option<Captures<'a>> {
     if !function.body.as_deref()?.directives.is_empty() {
         return None;
@@ -200,16 +202,20 @@ pub(super) fn matches<'a>(
         function,
         Routine::function(function)?,
         helpers,
+        members,
     )
 }
 
-/// Matches `template` against `routine`, which is `function`'s or is assembled from it.
+/// Matches `template` against `routine`, which is `function`'s or is assembled from it. `members`
+/// gives the register-file field roles of the function being matched; template register fields
+/// match actual fields by role.
 pub(super) fn matches_routine<'a>(
     template: &ParsedScript,
     script: Script<'a>,
     function: &'a Function<'a>,
     routine: Routine<'a>,
     helpers: &BinaryHelpers<'a>,
+    members: &Members,
 ) -> Option<Captures<'a>> {
     let template = template.script();
     let template_function = template_function(template);
@@ -223,6 +229,8 @@ pub(super) fn matches_routine<'a>(
         helpers,
         inlined: RefCell::default(),
         allocator: Allocator::default(),
+        template_members: Members::legacy(),
+        members: members.clone(),
     };
     let mut state = State::default();
     if !matcher.routine(template_function, function, routine, &mut state) {
@@ -265,6 +273,12 @@ struct Matcher<'t, 'a, 'helpers> {
     inlined: RefCell<BTreeSet<Binding<'a>>>,
     /// Holds normal forms of the function's expressions.
     allocator: Allocator,
+    /// Register-file member roles in the template, which uses one build's field names.
+    template_members: Members,
+    /// Register-file member roles in the function being matched, derived per build. A template
+    /// register field matches an actual field with the same role, so a build's reshuffled register
+    /// names still match.
+    members: Members,
 }
 
 /// Visits a routine's parameters, statements, and what it returns. Its declarations have no
@@ -1045,6 +1059,18 @@ impl<'a> Matcher<'_, 'a, '_> {
         }
     }
 
+    /// Whether a template property name matches an actual one: equal names, or register-file
+    /// fields with the same role under their respective builds' names.
+    fn same_property(&self, template: &str, actual: &str) -> bool {
+        if template == actual {
+            return true;
+        }
+        match (self.template_members.of(template), self.members.of(actual)) {
+            (Some(template), Some(actual)) => template == actual,
+            _ => false,
+        }
+    }
+
     fn member(
         &self,
         template: &MemberExpression<'_>,
@@ -1061,7 +1087,7 @@ impl<'a> Matcher<'_, 'a, '_> {
                 (
                     MemberExpression::StaticMemberExpression(template),
                     MemberExpression::StaticMemberExpression(actual),
-                ) => template.property.name == actual.property.name,
+                ) => self.same_property(&template.property.name, &actual.property.name),
                 (
                     MemberExpression::ComputedMemberExpression(template),
                     MemberExpression::ComputedMemberExpression(actual),
@@ -1647,7 +1673,13 @@ mod tests {
         let template = super::template(template);
         let actual = super::template(actual);
         let script = actual.script();
-        let captures = matches(&template, script, template_function(script), &helpers)?;
+        let captures = matches(
+            &template,
+            script,
+            template_function(script),
+            &helpers,
+            &Members::legacy(),
+        )?;
         let names = captures
             .names
             .iter()
