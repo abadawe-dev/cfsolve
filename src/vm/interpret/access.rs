@@ -113,10 +113,14 @@ impl<'ast> Run<'ast, '_> {
             }
             Value::RegisterSlots(Slots::Tags) => {
                 let register = self.register(key)?;
+                // The interpreter decodes records when they are stored and drops their tag, so a
+                // register holds a decoded value with no tag. A handler that peeks a register's tag
+                // to copy a record without decoding it (`registers.tags[i] === -4`) must see a
+                // plain tag for such a register, since its value is already decoded.
                 self.tags
                     .get(&register)
                     .cloned()
-                    .ok_or_else(|| unsupported("tag of a register", key))?
+                    .unwrap_or(Value::Number(0.0))
             }
             Value::Program => match (index, name) {
                 (Some(index), _) => convert::index(index)
