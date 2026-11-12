@@ -179,6 +179,27 @@ pub(crate) fn derive(
         .context("no write-router route for the dispatch-key index")?;
     let pc_setter = find_setter(&setters, pc_route.setter, "program counter")?;
     let key_setter = find_setter(&setters, key_route.setter, "dispatch key")?;
+    ensure!(
+        pc_setter.symbol != key_setter.symbol,
+        "the counter and key write routes call the same setter"
+    );
+    // Every write router must route exactly the counter and key index fields to their two setters,
+    // so a stray router-shaped function or a mis-recognized route fails loudly instead of supplying
+    // a wrong pc/key mapping. The read accessor anchors which index is the counter's.
+    for route in &routes {
+        let setter = if route.index == read.pc_index {
+            pc_route.setter
+        } else if route.index == key_route.index {
+            key_route.setter
+        } else {
+            bail!("a write router routes an unexpected index field {:?}", route.index);
+        };
+        ensure!(
+            route.setter == setter,
+            "a write router routes index {:?} to an unexpected setter",
+            route.index
+        );
+    }
 
     let mut members = Members::default();
     members.insert(&read.tags, Member::Tags)?;

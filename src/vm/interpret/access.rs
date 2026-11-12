@@ -113,14 +113,19 @@ impl<'ast> Run<'ast, '_> {
             }
             Value::RegisterSlots(Slots::Tags) => {
                 let register = self.register(key)?;
-                // The interpreter decodes records when they are stored and drops their tag, so a
-                // register holds a decoded value with no tag. A handler that peeks a register's tag
-                // to copy a record without decoding it (`registers.tags[i] === -4`) must see a
-                // plain tag for such a register, since its value is already decoded.
-                self.tags
-                    .get(&register)
-                    .cloned()
-                    .unwrap_or(Value::Number(0.0))
+                match self.tags.get(&register) {
+                    Some(tag) => tag.clone(),
+                    // No tag this run: the register's record-ness is unknown (it was written in a
+                    // prior instruction, or seeded by the constructor, or never set). Read the tag
+                    // symbolically so a handler that peeks it (`registers.tags[i] === -4`, to copy a
+                    // record without decoding it) explores both the record and non-record branches.
+                    // A real divergence then surfaces as an unresolved term rather than being
+                    // silently pruned by a plain default.
+                    None => Value::symbolic(Term::Get(
+                        Box::new(Term::Field("registerTags".into())),
+                        Box::new(Term::Const(Constant::Number(f64::from(register)))),
+                    )),
+                }
             }
             Value::Program => match (index, name) {
                 (Some(index), _) => convert::index(index)

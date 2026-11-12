@@ -1059,15 +1059,20 @@ impl<'a> Matcher<'_, 'a, '_> {
         }
     }
 
-    /// Whether a template property name matches an actual one. Register-file fields match by role
-    /// (so a build's reshuffled names still match, and a field never matches one of a different
-    /// role even when the names happen to coincide); every other property matches by name.
-    fn same_property(&self, template: &str, actual: &str) -> bool {
-        match (self.template_members.of(template), self.members.of(actual)) {
-            (Some(template), Some(actual)) => template == actual,
-            (None, None) => template == actual,
-            _ => false,
+    /// Whether a template member access on `object` matches the actual property `actual`.
+    /// A field of the register file (the template parameter `registers`) matches by ROLE, so a
+    /// build's reshuffled names still match and a field never matches one of a different role even
+    /// when the names coincide; every other property — including a non-register property that
+    /// happens to share a register field's name — matches by NAME.
+    fn same_property(&self, object: &Expression<'_>, template: &str, actual: &str) -> bool {
+        if matches!(object, Expression::Identifier(name) if name.name == "registers") {
+            return match (self.template_members.of(template), self.members.of(actual)) {
+                (Some(template), Some(actual)) => template == actual,
+                // A register-file member neither map knows (a method, say) matches by name.
+                _ => template == actual,
+            };
         }
+        template == actual
     }
 
     fn member(
@@ -1086,7 +1091,11 @@ impl<'a> Matcher<'_, 'a, '_> {
                 (
                     MemberExpression::StaticMemberExpression(template),
                     MemberExpression::StaticMemberExpression(actual),
-                ) => self.same_property(&template.property.name, &actual.property.name),
+                ) => self.same_property(
+                    &template.object,
+                    &template.property.name,
+                    &actual.property.name,
+                ),
                 (
                     MemberExpression::ComputedMemberExpression(template),
                     MemberExpression::ComputedMemberExpression(actual),
