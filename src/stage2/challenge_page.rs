@@ -247,7 +247,7 @@ impl PrecursorProgram {
         // build sets a hidden iframe and passes the address straight to a loader call. Found by
         // Cloudflare's challenge-platform path, the one part common to both, not by an element key.
         let script = reader.script_address()?;
-        let callback = candidates::exactly_one(reader.option_callbacks(), "precursor callback")?;
+        let callback = reader.precursor_callback()?;
         let finish = reader
             .stores_in(index.function_at(callback))
             .filter_map(|store| match reader.origin(store.pc, &store.value)? {
@@ -450,21 +450,69 @@ impl Reader<'_> {
             .context("the program concatenates no challenge-platform address")
     }
 
-    /// Entry points of the program functions stored on `window._cf_chl_opt`, directly or
-    /// through cells, for another script to call.
-    fn option_callbacks(&self) -> BTreeSet<u32> {
+    /// Entry points of the program functions a store registers as a property value on some
+    /// object, directly or through a cell holding them, keeping only the stores `host` accepts.
+    /// These are the closures the program exposes for another script to call back.
+    fn registered_closures(&self, host: impl Fn(&Store) -> bool) -> BTreeSet<u32> {
         let mut entries = BTreeSet::new();
         for store in self.index.stores() {
-            let on_options = self.index.holds_options(store.pc, &Term::Reg(store.object));
+            if !host(store) {
+                continue;
+            }
             match self.index.dereference(store.pc, &store.value) {
-                Some((_, Term::Closure { pc, .. })) if on_options => {
+                Some((_, Term::Closure { pc, .. })) => {
                     entries.insert(pc);
                 }
-                Some((_, Term::Cell(cell))) if on_options => entries.extend(self.closures_in(cell)),
+                Some((_, Term::Cell(cell))) => entries.extend(self.closures_in(cell)),
                 _ => {}
             }
         }
         entries
+    }
+
+    /// Entry points of the program functions stored on `window._cf_chl_opt`, directly or
+    /// through cells, for another script to call.
+    fn option_callbacks(&self) -> BTreeSet<u32> {
+        self.registered_closures(|store| {
+            self.index.holds_options(store.pc, &Term::Reg(store.object))
+        })
+    }
+
+    /// The entry of the completion callback the loaded challenge invokes when it finishes. It
+    /// writes the record's status (an integer completion code, 3 for a script that ran) and
+    /// message, which [`PrecursorProgram::recover`] reports as the record's `finish` fields.
+    ///
+    /// Older builds register it on `window._cf_chl_opt`, where [`Self::option_callbacks`] finds
+    /// it; this build registers it on another object and keeps no callback on the options
+    /// object, so it is found by what it writes — the record's completion status — rather than
+    /// by its host. Exactly one callback is expected on either build; a second candidate is a
+    /// build this code does not yet model, so it fails rather than guesses.
+    fn precursor_callback(&self) -> Result<u32> {
+        let on_options = self.option_callbacks();
+        if !on_options.is_empty() {
+            return candidates::exactly_one(on_options, "precursor callback");
+        }
+        let closers = self
+            .registered_closures(|_| true)
+            .into_iter()
+            .filter(|&entry| self.closes_record(entry));
+        candidates::exactly_one(closers, "precursor callback")
+    }
+
+    /// Whether the closure at `entry` closes the record: its body writes the completion status,
+    /// a numeric literal, under one of the record's obfuscated fields (which Cloudflare names
+    /// `_<hash>`). The iframe builder writes numbers to plain DOM keys, and the program's other
+    /// registered closures write no numeric status, so this picks out the completion callback.
+    fn closes_record(&self, entry: u32) -> bool {
+        self.stores_in(self.index.function_at(entry)).any(|store| {
+            store.key.starts_with('_')
+                && matches!(
+                    self.origin(store.pc, &store.value),
+                    Some(Expression::Literal {
+                        value: JsValue::Number(_)
+                    })
+                )
+        })
     }
 
     fn window_literals(&self) -> Window {
