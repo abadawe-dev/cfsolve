@@ -789,6 +789,38 @@ mod tests {
         assert_eq!(derived.writes.len(), 2, "Iw and kib_1 are write routers");
     }
 
+    /// The register file and its read, setter, and router accessors lifted verbatim from a real
+    /// capture of build 7c7fee70a876's orchestrator, as cfsolve's own deobfuscation produces it (the
+    /// form `derive` consumes). This tracks the shipped build's exact structure, where the synthetic
+    /// snippet above only tracks its shape; `recognizes_saved_script` additionally runs `derive` over
+    /// the whole captured script.
+    #[test]
+    fn derives_the_captured_build_roles() {
+        let derived = derive_from(include_str!("testdata/registers-7c7fee70a876.js"))
+            .expect("derivation from the captured build");
+        let m = &derived.members;
+        let roles = [
+            ("H", Member::Values),
+            ("J", Member::Tags),
+            ("D", Member::PcIndex),
+            ("F", Member::KeyIndex),
+            ("i", Member::Pc),
+            ("l", Member::Key),
+            ("j", Member::Integer),
+            ("m", Member::Integer),
+            ("A", Member::OtherPc),
+            ("v", Member::OtherKey),
+            ("h", Member::Mask),
+            ("O", Member::Mask),
+            ("L", Member::Mask),
+            ("K", Member::Mask),
+        ];
+        for (name, role) in roles {
+            assert_eq!(m.of(name), Some(role), "role of {name}");
+        }
+        assert_eq!(derived.writes.len(), 2, "Iw and kib_1 are the write routers");
+    }
+
     #[test]
     fn rejects_a_field_with_two_roles() {
         // The read accessor claims `h` is the mask; a setter that stored its value in `h` too
