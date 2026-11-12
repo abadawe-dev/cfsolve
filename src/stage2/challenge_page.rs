@@ -202,9 +202,31 @@ pub(crate) fn renders_widget(listing: &Listing) -> bool {
     index.stores().iter().any(|store| store.key == "sitekey")
 }
 
+/// How a first-response program completes the challenge once its record is built.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Completion {
+    /// It loads a script at this challenge-platform address (not a `/fo/` endpoint) into the
+    /// page; the script's `onload` closes the record. The parts are concatenated and resolved at
+    /// solve time.
+    Script(Vec<Expression>),
+    /// It posts the second payload straight to this `/fo/` endpoint — the challenge's own POST
+    /// URL — with no script to load. A managed challenge (EB Games) completes this way.
+    Submit(Vec<Expression>),
+}
+
+/// A first-response program's completion address, resolved against the page.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CompletionTarget {
+    /// A script to load, then report; close the record over the load's timing.
+    Script(Url),
+    /// The challenge's `/fo/` endpoint to post the second payload to directly.
+    Submit(Url),
+}
+
 /// A precursor interstitial's first response program. It loads Cloudflare's precursor script
 /// into the page, handing it a callback on `window._cf_chl_opt`, and sends its second payload
-/// once the script has run and called back.
+/// once the script has run and called back. A managed challenge instead posts the second payload
+/// straight to the challenge endpoint with no script.
 #[derive(Debug)]
 pub(crate) struct PrecursorProgram {
     /// The record counter, which the template starts at zero.
@@ -212,8 +234,8 @@ pub(crate) struct PrecursorProgram {
     pub layout: Layout,
     /// The record the program adds, with its literal token and input.
     pub record: RecordTemplate,
-    /// The script's address, as the parts the program concatenates.
-    pub script: Vec<Expression>,
+    /// How the program completes the challenge.
+    pub completion: Completion,
     /// The record's status and message, as the callback writes them, in order.
     pub finish: Vec<(String, JsValue)>,
     /// Copied start time, end time, and duration fields. The original start field is cleared
@@ -243,10 +265,7 @@ impl PrecursorProgram {
             index: &index,
             pool,
         };
-        // The address the program loads. Older builds assign it to an element's `src`; this
-        // build sets a hidden iframe and passes the address straight to a loader call. Found by
-        // Cloudflare's challenge-platform path, the one part common to both, not by an element key.
-        let script = reader.script_address()?;
+        let completion = reader.completion()?;
         let callback = reader.precursor_callback()?;
         let finish = reader
             .stores_in(index.function_at(callback))
@@ -262,7 +281,7 @@ impl PrecursorProgram {
             counter,
             layout,
             record,
-            script,
+            completion,
             finish,
             started,
             ended,
@@ -271,18 +290,30 @@ impl PrecursorProgram {
         })
     }
 
-    /// The precursor script's address on `page`.
-    pub(crate) fn script_url(&self, options: &Options, window: &Window, page: &Url) -> Result<Url> {
-        let mut path = String::new();
-        for part in &self.script {
-            let value = resolve(part, options, window)?;
-            let text = value
-                .as_ref()
-                .and_then(JsValue::as_str)
-                .with_context(|| format!("precursor script address part {part:?} is not text"))?;
-            path.push_str(text);
+    /// The program's completion address, resolved against `page`: the script it loads, or the
+    /// `/fo/` endpoint it posts straight to.
+    pub(crate) fn target(
+        &self,
+        options: &Options,
+        window: &Window,
+        page: &Url,
+    ) -> Result<CompletionTarget> {
+        let address = |parts: &[Expression]| {
+            let mut path = String::new();
+            for part in parts {
+                let value = resolve(part, options, window)?;
+                let text = value
+                    .as_ref()
+                    .and_then(JsValue::as_str)
+                    .with_context(|| format!("challenge address part {part:?} is not text"))?;
+                path.push_str(text);
+            }
+            Ok::<_, anyhow::Error>(page.join(&path)?)
+        };
+        match &self.completion {
+            Completion::Script(parts) => Ok(CompletionTarget::Script(address(parts)?)),
+            Completion::Submit(parts) => Ok(CompletionTarget::Submit(address(parts)?)),
         }
-        Ok(page.join(&path)?)
     }
 
     /// Builds the payload passed to the orchestrator sender once the script has called back,
@@ -417,19 +448,31 @@ impl Reader<'_> {
         Some(vec![self.origin(pc, term)?])
     }
 
-    /// The challenge address the program loads, as the parts it concatenates. Cloudflare's
-    /// challenge-platform path is the one part every build keeps (older builds join it with the
-    /// route as `/cdn-cgi/challenge-platform/h/`, this build keeps it a part of its own), so the
-    /// address is the concatenation holding a literal that begins with it — whether the program
-    /// assigns it to an element's `src` or passes it to a loader call. One is expected; a second,
-    /// different one is a mismatch to fail on rather than guess between.
-    fn script_address(&self) -> Result<Vec<Expression>> {
-        let on_platform = |parts: &Vec<Expression>| {
-            parts.iter().any(|part| {
-                matches!(part, Expression::Literal { value }
-                    if value.as_str().is_some_and(|text| text.starts_with(PLATFORM_PATH)))
-            })
+    /// How the program completes the challenge, found by the challenge-platform addresses it
+    /// concatenates. Cloudflare's challenge-platform path is the one part every address keeps, so
+    /// a completion address is a concatenation holding a literal that begins with it — whether the
+    /// program assigns it to an element's `src` or passes it to a call.
+    ///
+    /// A script-loading precursor builds a script address on the challenge platform (not a `/fo/`
+    /// endpoint) and loads it; it also builds the `/fo/` endpoint it posts to, which is the
+    /// orchestrator's own POST URL, so both appear. A managed challenge builds only the `/fo/`
+    /// endpoint and posts straight to it. So a script address, when present, is the one the
+    /// program loads; without one, the `/fo/` endpoint is the direct-submit target. One of each
+    /// kind is expected; a second, different one is a mismatch to fail on rather than guess.
+    fn completion(&self) -> Result<Completion> {
+        let literal = |part: &Expression| match part {
+            Expression::Literal { value } => value.as_str().map(str::to_owned),
+            _ => None,
         };
+        let on_platform = |parts: &Vec<Expression>| {
+            parts
+                .iter()
+                .filter_map(literal)
+                .any(|text| text.starts_with(PLATFORM_PATH))
+        };
+        // The `/fo/` segment and the platform prefix are literal parts of the address; the option
+        // reads between them are the variant and the ray and token, never the route.
+        let posts = |parts: &Vec<Expression>| parts.iter().filter_map(literal).any(|text| text.contains("/fo/"));
         let assigned = self
             .index
             .stores()
@@ -446,8 +489,15 @@ impl Reader<'_> {
                         .filter_map(move |argument| self.concatenation(pc, argument))
                 })
         });
-        candidates::at_most_one_distinct(assigned.chain(passed).filter(on_platform), "challenge address")?
-            .context("the program concatenates no challenge-platform address")
+        let addresses = assigned.chain(passed).filter(on_platform);
+        // Split the posting `/fo/` endpoint from a loaded script address.
+        let (submit, script): (Vec<_>, Vec<_>) = addresses.partition(posts);
+        if let Some(script) = candidates::at_most_one_distinct(script, "precursor script address")? {
+            return Ok(Completion::Script(script));
+        }
+        let submit = candidates::at_most_one_distinct(submit, "challenge submission address")?
+            .context("the program concatenates no challenge-platform address")?;
+        Ok(Completion::Submit(submit))
     }
 
     /// Entry points of the program functions a store registers as a property value on some

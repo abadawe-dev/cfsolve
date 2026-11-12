@@ -4,7 +4,7 @@
 //! precursor interstitial, the first response loads Cloudflare's precursor script instead of a
 //! widget, and the second payload reports that the script ran.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use url::Url;
 use wreq::StatusCode;
@@ -27,12 +27,12 @@ use crate::embedding_page::page::{Params, RenderedPage};
 use crate::embedding_page::render_sample::RenderSample;
 use crate::engine::{self, Engine, Lines};
 use crate::error::Refused;
-use crate::http::{self, BrowserClient, ReferrerPolicy, ScriptLoad};
+use crate::http::{self, BrowserClient, PageDocument, ReferrerPolicy, ScriptLoad};
 use crate::js::{JsValue, Options, Payload, Window};
 use crate::resource_timing::{LoadTiming, Phases, ResourceMeasurement};
 use crate::script::Source;
 use crate::stage2::call_stack::{self, CaseOpcodes, ScriptPosition};
-use crate::stage2::challenge_page::{self, Form, PrecursorProgram, Settled, WidgetProgram};
+use crate::stage2::challenge_page::{self, CompletionTarget, Form, PrecursorProgram, Settled, WidgetProgram};
 use crate::stage2::payload::{Environment, State};
 use crate::{embedding_page, performance_clock};
 
@@ -321,7 +321,7 @@ impl OrchestratorSession {
         let mut options = orchestration.request.options.clone();
         if let Some(timing) = &widget.merged.state.timing {
             let iframe = ProgramLoad::Iframe(&widget.fetched.navigation);
-            let entries = orchestration.page_resource_timing(timing, iframe);
+            let entries = orchestration.page_resource_timing(timing, Some(iframe));
             options.insert(timing.option.clone(), JsValue::Array(entries));
         }
         let calls = Window::new();
@@ -342,22 +342,42 @@ impl OrchestratorSession {
 }
 
 impl PrecursorSession {
-    /// Loads the precursor script as the first response's program does, reports that it ran,
-    /// and submits the returned clearance form for the protected page.
+    /// Runs the first response's program as it loads the challenge address it built, reports that
+    /// it ran, and submits the returned clearance form for the protected page.
+    ///
+    /// Two builds reach here. A script-loading precursor concatenates a script address on the
+    /// page's own origin, which the program inserts and whose `onload` closes the record; it is
+    /// fetched over a GET. A direct-submit build (EB Games) concatenates the challenge's own
+    /// `/fo/` payload endpoint and hands it to the orchestrator's sender, which posts the second
+    /// payload straight to it — the same endpoint the first payload used — with no script to load.
     pub(crate) async fn clear(&self, client: &BrowserClient, sink: &dyn Sink) -> Result<Clearance> {
         let orchestration = &self.orchestration;
-        let challenge = &orchestration.challenge;
-        let script = self.program.script_url(
+        let target = self.program.target(
             &orchestration.request.options,
             &orchestration.window,
-            &challenge.url,
+            &orchestration.challenge.url,
         )?;
+        match target {
+            CompletionTarget::Script(script) => self.load_script(client, sink, &script).await,
+            CompletionTarget::Submit(endpoint) => self.submit(client, sink, &endpoint).await,
+        }
+    }
+
+    /// The script-loading precursor path: fetches the precursor script over a GET, times the load,
+    /// reports that it ran, and submits with the script's resource-timing entry included.
+    async fn load_script(
+        &self,
+        client: &BrowserClient,
+        sink: &dyn Sink,
+        script: &Url,
+    ) -> Result<Clearance> {
+        let orchestration = &self.orchestration;
         // The program creates its record, then inserts the script into the page, whose address
         // the orchestrator has restored by now. The script calls back as soon as it has run,
         // which closes the record.
         timing::sleep_until(orchestration.record_started_ms).await;
         let timer = Timer::start();
-        let source = http::fetch_page_script(client, &script, &challenge.url)
+        let source = http::fetch_page_script(client, script, &orchestration.challenge.url)
             .await
             .context("loading the precursor script")?;
         let load = timer.overall(script.as_str(), source.len() as u64);
@@ -368,32 +388,75 @@ impl PrecursorSession {
             source.len()
         ));
         let ended_ms = load.ended_ms() as i64;
-        let mut options = orchestration.request.options.clone();
-        if let Some(timing) = &orchestration.state.timing {
-            let entries = orchestration.page_resource_timing(timing, ProgramLoad::Script(&load));
-            options.insert(timing.option.clone(), JsValue::Array(entries));
-        }
-        let calls = Window::new();
-        let state = State {
-            environment: Environment {
-                options: &options,
-                window: &orchestration.window,
-                calls: &calls,
-            },
-            input: &orchestration.first,
+        let plaintext = |options: &Options| {
+            let calls = Window::new();
+            let state = State {
+                environment: Environment {
+                    options,
+                    window: &orchestration.window,
+                    calls: &calls,
+                },
+                input: &orchestration.first,
+            };
+            self.program
+                .payload(&state, orchestration.record_started_ms, ended_ms)
         };
-        let plaintext = self
-            .program
-            .payload(&state, orchestration.record_started_ms, ended_ms)?;
         orchestration
-            .clear(client, sink, &options, plaintext, ended_ms + 1)
+            .report(
+                client,
+                sink,
+                Some(ProgramLoad::Script(&load)),
+                ended_ms,
+                plaintext,
+            )
+            .await
+    }
+
+    /// The direct-submit path (EB Games): the program built the challenge's own `/fo/` payload
+    /// endpoint, not a script, so there is no load. It opens and closes its record in the same
+    /// synchronous turn (duration zero) and posts the second payload straight to that endpoint,
+    /// which is the orchestrator's own POST URL.
+    async fn submit(&self, client: &BrowserClient, sink: &dyn Sink, address: &Url) -> Result<Clearance> {
+        let orchestration = &self.orchestration;
+        ensure!(
+            *address == orchestration.request.url,
+            "the program posts its second payload to {address}, not the orchestrator's endpoint {}",
+            orchestration.request.url
+        );
+        sink.progress(
+            "The orchestrator posts its second payload straight to the challenge endpoint instead \
+             of loading a precursor script; reporting that it ran",
+        );
+        // No script loads, so the record spans no time: it opens when the program starts and
+        // closes in the same turn, before the orchestrator sends.
+        let marked_ms = orchestration.record_started_ms;
+        let plaintext = |options: &Options| {
+            let calls = Window::new();
+            let state = State {
+                environment: Environment {
+                    options,
+                    window: &orchestration.window,
+                    calls: &calls,
+                },
+                input: &orchestration.first,
+            };
+            self.program.payload(&state, marked_ms, marked_ms)
+        };
+        orchestration
+            .report(client, sink, None, marked_ms, plaintext)
             .await
     }
 }
 
 impl Orchestration {
-    /// The page's resource timing as the response program reads it, ending with `load`.
-    fn page_resource_timing(&self, timing: &ResourceTiming, load: ProgramLoad<'_>) -> Vec<JsValue> {
+    /// The page's resource timing as the response program reads it, ending with `load` when the
+    /// program starts one. A program that posts straight to the challenge endpoint starts none,
+    /// so `load` is `None` and the snapshot omits the trailing load entry.
+    fn page_resource_timing(
+        &self,
+        timing: &ResourceTiming,
+        load: Option<ProgramLoad<'_>>,
+    ) -> Vec<JsValue> {
         page_resource_timing(
             timing,
             self.phases,
@@ -404,8 +467,34 @@ impl Orchestration {
         )
     }
 
-    /// Sends the second payload, `plaintext`, at `send_at`, and submits the clearance form its
-    /// response builds from `options`, through `client`.
+    /// Reports a first-response program's completion. Adds the program's resource-timing read
+    /// (ending with `load`, or omitting the trailing entry when the program started none) to the
+    /// options, builds the second payload from those options, and clears the page by sending it
+    /// one millisecond after the record's `ended_ms`.
+    async fn report(
+        &self,
+        client: &BrowserClient,
+        sink: &dyn Sink,
+        load: Option<ProgramLoad<'_>>,
+        ended_ms: i64,
+        plaintext: impl FnOnce(&Options) -> Result<Payload>,
+    ) -> Result<Clearance> {
+        let mut options = self.request.options.clone();
+        if let Some(timing) = &self.state.timing {
+            let entries = self.page_resource_timing(timing, load);
+            options.insert(timing.option.clone(), JsValue::Array(entries));
+        }
+        let plaintext = plaintext(&options)?;
+        self.clear(client, sink, &options, plaintext, ended_ms + 1)
+            .await
+    }
+
+    /// Sends the second payload, `plaintext`, at `send_at`, and obtains the protected page.
+    ///
+    /// Two terminal shapes reach the page. A managed challenge grants clearance on the completion
+    /// POST itself: the response sets `cf_clearance` and its program reloads the protected page.
+    /// A precursor or widget challenge returns a clearance form whose submission sets the cookie.
+    /// They are told apart by whether the POST set `cf_clearance`.
     async fn clear(
         &self,
         client: &BrowserClient,
@@ -424,22 +513,19 @@ impl Orchestration {
         };
         let submission = Submission { plaintext, send_at };
         let returned = channel.submit(&submission, Stage::Clearance).await?;
-        let listing = self.source.disassemble(&returned.program)?;
-        let form = Form::recover(&listing).context("reading the clearance program")?;
-        let form = form.resolve(options, &self.window, &self.challenge.url)?;
-        let saved = ClearanceFormJson {
-            action: form.action.as_str(),
-            fields: &form.fields,
+        // A managed challenge grants clearance on the completion POST itself (its response sets
+        // `cf_clearance` and reloads the page it rewrote itself to while orchestrating); a
+        // precursor or widget challenge returns a clearance form whose submission sets the cookie.
+        let cleared = if self.granted_clearance(client) {
+            sink.progress("The completion POST set cf_clearance; reloading the page it cleared");
+            http::navigate(client, &self.challenge.loading).await?
+        } else {
+            self.submit_clearance_form(client, sink, options, &returned.program)
+                .await?
         };
-        sink.json("clearance-form.json", &saved)?;
-        // The form submission uses the restored page address as its referrer.
-        let referer = self
-            .challenge
-            .answered
-            .as_ref()
-            .unwrap_or(&self.challenge.url);
-        let cleared = http::submit_form(client, referer, &form.action, &form.fields).await?;
         sink.save("cleared.html", cleared.html.as_bytes())?;
+        // The cleared page must come back unchallenged. A cookie that leaves the guarded page
+        // still challenging is not a working clearance, so `accept_clearance` rejects it.
         let challenged = ChallengePage::parse(&cleared.html, &cleared.url)?.is_some();
         let cookies = client.cookies(&cleared.url);
         let clearance = cookies
@@ -459,24 +545,61 @@ impl Orchestration {
             page: cleared,
         })
     }
+
+    /// Whether the challenge URL now carries a `cf_clearance` cookie, which a managed challenge's
+    /// completion POST sets. This selects the reload terminal over the clearance-form one; the
+    /// reload must still come back unchallenged for the clearance to count.
+    fn granted_clearance(&self, client: &BrowserClient) -> bool {
+        client
+            .cookies(&self.challenge.url)
+            .iter()
+            .any(|cookie| cookie.name() == "cf_clearance")
+    }
+
+    /// Recovers the clearance form from the completion response `program` and submits it, with the
+    /// restored page address as its referrer. Returns the protected page the form submission
+    /// reaches.
+    async fn submit_clearance_form(
+        &self,
+        client: &BrowserClient,
+        sink: &dyn Sink,
+        options: &Options,
+        program: &[u8],
+    ) -> Result<PageDocument> {
+        let listing = self.source.disassemble(program)?;
+        let form = Form::recover(&listing).context("reading the clearance program")?;
+        let form = form.resolve(options, &self.window, &self.challenge.url)?;
+        let saved = ClearanceFormJson {
+            action: form.action.as_str(),
+            fields: &form.fields,
+        };
+        sink.json("clearance-form.json", &saved)?;
+        let referer = self
+            .challenge
+            .answered
+            .as_ref()
+            .unwrap_or(&self.challenge.url);
+        http::submit_form(client, referer, &form.action, &form.fields).await
+    }
 }
 
-/// Decides whether the clearance form passed the challenge, from the response to the form:
-/// its HTTP status, whether it is another challenge page, and the `cf_clearance` cookie it set,
-/// if any. Returns the cookie's value.
+/// Decides whether the challenge cleared, from the cleared page — the clearance form's response,
+/// or the reload after a managed grant: its HTTP status, whether it is another challenge page,
+/// and the `cf_clearance` cookie, if any. Returns the cookie's value.
 ///
-/// Cloudflare sets `cf_clearance` when the form passes. After that, the page behind the
-/// challenge can still answer with an error status. For example, a site's waiting room can
-/// answer HTTP 429 to the visitors it is queueing. So an error status with the cookie still
-/// counts as a pass. Another challenge page, or an error status without the cookie, means
-/// Cloudflare refused the answers.
+/// Cloudflare sets `cf_clearance` when the challenge passes. After that, the protected page can
+/// still answer with an error status. For example, a site's waiting room can answer HTTP 429 to
+/// the visitors it is queueing. So an error status with the cookie still counts as a pass.
+/// Another challenge page means the clearance does not work — the guarded page is still
+/// challenged, so the cookie is no clearance — and an error status without the cookie means the
+/// answers were refused.
 pub(crate) fn accept_clearance(
     status: StatusCode,
     challenged: bool,
     clearance: Option<String>,
 ) -> Result<String> {
     let refused = || {
-        let message = format!("the clearance form returned HTTP {status} without the page");
+        let message = format!("the protected page returned HTTP {status} without clearing");
         Refused::new(Stage::Clearance, message)
     };
     if challenged {
@@ -485,7 +608,7 @@ pub(crate) fn accept_clearance(
     match clearance {
         Some(clearance) => Ok(clearance),
         None if !status.is_success() => bail!(refused()),
-        None => bail!("the clearance form set no `cf_clearance` cookie"),
+        None => bail!("the challenge set no `cf_clearance` cookie"),
     }
 }
 
@@ -500,7 +623,8 @@ pub(crate) enum ProgramLoad<'load> {
 
 /// Builds two resource timing snapshots for the response program. The first includes the
 /// unfinished navigation and later loads. The second includes the finished navigation, first
-/// POST, a second icon entry, and the program's own `load`. Estimates unmeasured phases.
+/// POST, a second icon entry, and the program's own `load` when it starts one. Estimates
+/// unmeasured phases.
 #[must_use]
 pub(crate) fn page_resource_timing(
     timing: &ResourceTiming,
@@ -508,7 +632,7 @@ pub(crate) fn page_resource_timing(
     navigation: &LoadTiming,
     loads: &[LoadTiming],
     post: &LoadTiming,
-    load: ProgramLoad<'_>,
+    load: Option<ProgramLoad<'_>>,
 ) -> Vec<JsValue> {
     // Times run from the challenge page's navigation.
     let since = |load: &LoadTiming| (load.started_ms - navigation.started_ms) as f64;
@@ -542,7 +666,7 @@ pub(crate) fn page_resource_timing(
     entries.push(reduce(navigation, loaded));
     entries.push(timing.entry(post, navigation.started_ms));
     entries.extend(loads.last().map(estimate));
-    entries.push(match load {
+    entries.extend(load.map(|load| match load {
         ProgramLoad::Iframe(iframe) => {
             let end = since(iframe) + iframe.duration_ms;
             reduce(
@@ -551,6 +675,6 @@ pub(crate) fn page_resource_timing(
             )
         }
         ProgramLoad::Script(script) => estimate(script),
-    });
+    }));
     entries
 }
