@@ -46,8 +46,14 @@ fn the_pages_resource_timing_lists_both_of_the_widget_programs_reads() {
         response: 0.25,
     };
     let load = challenge_page::ProgramLoad::Iframe(&iframe);
-    let entries =
-        challenge_page::page_resource_timing(&timing, phases, &navigation, &loads, &post, load);
+    let entries = challenge_page::page_resource_timing(
+        &timing,
+        phases,
+        &navigation,
+        &loads,
+        &post,
+        Some(load),
+    );
     assert_eq!(
         entries,
         [
@@ -62,6 +68,53 @@ fn the_pages_resource_timing_lists_both_of_the_widget_programs_reads() {
             json!({"n": "https://page/favicon.ico", "d": 10, "r": 2, "b": 100}),
             // The cross-origin iframe shows only its end, from the navigation.
             json!({"n": "https://challenges/iframe", "d": 25, "r": 425, "b": 0}),
+        ]
+    );
+}
+
+/// A direct-submit program (EB Games) starts no load, so the snapshot ends at the repeated icon
+/// and omits the trailing program-load entry the script and iframe paths add.
+#[test]
+fn the_direct_submit_snapshot_omits_the_program_load() {
+    let timing = ResourceTiming {
+        option: "timing".into(),
+        fields: vec![
+            ("n".into(), Measure::Name),
+            ("d".into(), Measure::Duration),
+            ("r".into(), Measure::Response),
+            ("b".into(), Measure::Body),
+        ],
+    };
+    let navigation = fetch("https://page/", 1_000, 50.0);
+    let loads = [
+        fetch("https://page/orchestrate.js", 1_060, 20.0),
+        fetch("https://page/favicon.ico", 1_090, 10.0),
+    ];
+    let post = fetch("https://page/flow", 1_100, 30.0);
+    let phases = Phases {
+        request: 0.5,
+        response: 0.25,
+    };
+    let entries = challenge_page::page_resource_timing(
+        &timing,
+        phases,
+        &navigation,
+        &loads,
+        &post,
+        None,
+    );
+    assert_eq!(
+        entries,
+        [
+            // Still loading.
+            json!({"n": "https://page/", "d": 0, "r": 12, "b": 100}),
+            json!({"n": "https://page/orchestrate.js", "d": 20, "r": 5, "b": 100}),
+            json!({"n": "https://page/favicon.ico", "d": 10, "r": 2, "b": 100}),
+            // Finished once the last load (the icon, at 1100) ended.
+            json!({"n": "https://page/", "d": 100, "r": 12, "b": 100}),
+            json!({"n": "https://page/flow", "d": 30, "r": 0, "b": 100}),
+            json!({"n": "https://page/favicon.ico", "d": 10, "r": 2, "b": 100}),
+            // No program load entry: the program posted straight to the challenge endpoint.
         ]
     );
 }
