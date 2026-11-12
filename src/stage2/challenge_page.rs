@@ -26,6 +26,10 @@ use crate::stage2::queries;
 use crate::vm::{Constant, Effect, Listing, Term};
 
 /// Widget parameters passed to `turnstile.render`, excluding callbacks.
+/// Cloudflare's challenge-platform path, the one part of a loaded challenge address that every
+/// build keeps, used to find the address by structure rather than by the element key it takes.
+const PLATFORM_PATH: &str = "/cdn-cgi/challenge-platform";
+
 const RENDER_PARAMETERS: [&str; 8] = [
     "sitekey",
     "theme",
@@ -239,16 +243,10 @@ impl PrecursorProgram {
             index: &index,
             pool,
         };
-        // The script element's `src`; the program's other elements are a sandbox iframe and
-        // workers, which it gives no address.
-        let script = candidates::exactly_one(
-            index
-                .stores()
-                .iter()
-                .filter(|store| store.key == "src")
-                .filter_map(|store| reader.concatenation(store.pc, &store.value)),
-            "precursor script address",
-        )?;
+        // The address the program loads. Older builds assign it to an element's `src`; this
+        // build sets a hidden iframe and passes the address straight to a loader call. Found by
+        // Cloudflare's challenge-platform path, the one part common to both, not by an element key.
+        let script = reader.script_address()?;
         let callback = candidates::exactly_one(reader.option_callbacks(), "precursor callback")?;
         let finish = reader
             .stores_in(index.function_at(callback))
@@ -417,6 +415,39 @@ impl Reader<'_> {
             return Some(parts);
         }
         Some(vec![self.origin(pc, term)?])
+    }
+
+    /// The challenge address the program loads, as the parts it concatenates. Cloudflare's
+    /// challenge-platform path is the one part every build keeps (older builds join it with the
+    /// route as `/cdn-cgi/challenge-platform/h/`, this build keeps it a part of its own), so the
+    /// address is the concatenation holding a literal that begins with it — whether the program
+    /// assigns it to an element's `src` or passes it to a loader call. One is expected; a second,
+    /// different one is a mismatch to fail on rather than guess between.
+    fn script_address(&self) -> Result<Vec<Expression>> {
+        let on_platform = |parts: &Vec<Expression>| {
+            parts.iter().any(|part| {
+                matches!(part, Expression::Literal { value }
+                    if value.as_str().is_some_and(|text| text.starts_with(PLATFORM_PATH)))
+            })
+        };
+        let assigned = self
+            .index
+            .stores()
+            .iter()
+            .filter(|store| store.key == "src")
+            .filter_map(|store| self.concatenation(store.pc, &store.value));
+        let passed = self.index.effects_in(..).flat_map(|(pc, effect)| {
+            effect
+                .call()
+                .into_iter()
+                .flat_map(move |(_, arguments)| {
+                    arguments
+                        .iter()
+                        .filter_map(move |argument| self.concatenation(pc, argument))
+                })
+        });
+        candidates::at_most_one_distinct(assigned.chain(passed).filter(on_platform), "challenge address")?
+            .context("the program concatenates no challenge-platform address")
     }
 
     /// Entry points of the program functions stored on `window._cf_chl_opt`, directly or
