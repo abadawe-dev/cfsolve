@@ -334,18 +334,20 @@ fn collect_routes<'a>(
                 setter,
             });
         }
-        if let Some(alternate) = &branch.alternate {
-            collect_routes(
-                script,
-                std::slice::from_ref(alternate),
-                file,
-                index,
-                value,
-                routes,
-            );
-        }
-        if let Statement::BlockStatement(block) = &branch.consequent {
-            collect_routes(script, &block.body, file, index, value, routes);
+        // Follow both branches, through `else if` chains and `else { ... }` / `if { ... }` blocks,
+        // so a router whose key route sits in a nested block is not missed.
+        for nested in [branch.alternate.as_ref(), Some(&branch.consequent)]
+            .into_iter()
+            .flatten()
+        {
+            match nested {
+                Statement::BlockStatement(block) => {
+                    collect_routes(script, &block.body, file, index, value, routes);
+                }
+                other => {
+                    collect_routes(script, std::slice::from_ref(other), file, index, value, routes);
+                }
+            }
         }
     }
 }

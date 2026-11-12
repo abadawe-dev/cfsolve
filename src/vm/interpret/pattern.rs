@@ -1059,14 +1059,13 @@ impl<'a> Matcher<'_, 'a, '_> {
         }
     }
 
-    /// Whether a template property name matches an actual one: equal names, or register-file
-    /// fields with the same role under their respective builds' names.
+    /// Whether a template property name matches an actual one. Register-file fields match by role
+    /// (so a build's reshuffled names still match, and a field never matches one of a different
+    /// role even when the names happen to coincide); every other property matches by name.
     fn same_property(&self, template: &str, actual: &str) -> bool {
-        if template == actual {
-            return true;
-        }
         match (self.template_members.of(template), self.members.of(actual)) {
             (Some(template), Some(actual)) => template == actual,
+            (None, None) => template == actual,
             _ => false,
         }
     }
