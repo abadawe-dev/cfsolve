@@ -11,7 +11,7 @@ pub(crate) mod ice;
 pub(crate) mod image;
 pub(crate) mod media;
 pub(super) mod network_information;
-pub(super) mod parent_info;
+pub(crate) mod parent_info;
 pub(crate) mod performance;
 mod platform;
 pub(crate) mod private_token;

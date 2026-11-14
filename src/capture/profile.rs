@@ -29,14 +29,14 @@ use crate::challenge::payload::Field;
 use crate::challenge::program::PreparedSession;
 use crate::challenge::state::{Intervals, ScriptState};
 use crate::embedding_page::extra_params::{ElapsedTimes, Timeline};
+use crate::embedding_page::page::PageSignals;
 use crate::http::{HeaderOrder, RequestKind};
 use crate::js::{self, JsObject, JsValue, Payload};
 use crate::script::Source;
 use crate::stage2::analysis;
 use crate::stage2::benchmark::WorkerCosts;
-use crate::stage2::probes::ice;
 use crate::stage2::probes::media::Measurement;
-use crate::stage2::reference::PARENT_INFO_WIDGET_POSITION;
+use crate::stage2::probes::{ice, parent_info};
 use crate::stage2::registry::{Kind, Operation};
 
 /// Updates measured profile values from `recordings`. Returns notes about the sources used and data
@@ -347,11 +347,8 @@ impl Reported {
                 }
                 // A site's widget is placed by the site's own page, which the profile does not
                 // describe.
-                Operation::ParentInfo {} if on_challenge_page => {
-                    let mut observed = record.clone();
-                    plan.vocabulary()
-                        .rewrite_to_reference(probe.position(), &mut observed);
-                    match placement(&observed) {
+                Operation::ParentInfo { fields } if on_challenge_page => {
+                    match placement(fields, record) {
                         Ok(placement) => self.placements.push(placement),
                         Err(error) => problems.push(error.context("reading the widget placement")),
                     }
@@ -556,10 +553,12 @@ impl Reported {
     }
 }
 
-/// Reads the widget wrapper's `top|right` from a parent-info record in reference names.
-fn placement(record: &JsObject) -> Result<(f64, f64)> {
-    let position = record
-        .get(PARENT_INFO_WIDGET_POSITION)
+/// Reads the widget wrapper's `top|right` from a parent-info record: the field its probe copies
+/// the embedding page's widget position to.
+fn placement(fields: &parent_info::Fields, record: &JsObject) -> Result<(f64, f64)> {
+    let position = fields
+        .element(PageSignals::WIDGET_POSITION)
+        .and_then(|field| record.get(field))
         .and_then(JsValue::as_str)
         .context("the record has no widget position")?;
     let (top, right) = position
@@ -686,15 +685,24 @@ mod tests {
             profile["browser"]["challenge_page"],
             serde_json::json!({"top": 304.0, "left": 511.5, "right": 1407.5})
         );
-        assert_eq!(
-            placement(&JsObject::from_iter([(
-                PARENT_INFO_WIDGET_POSITION.to_owned(),
-                json!("378|359")
-            )]))
-            .unwrap(),
-            (378.0, 359.0)
-        );
-        assert!(placement(&JsObject::new()).is_err());
+        let fields = parent_info::Fields {
+            reads: [
+                ("xpath".to_owned(), parent_info::Read::Element { index: 28 }),
+                (
+                    "position".to_owned(),
+                    parent_info::Read::Element {
+                        index: PageSignals::WIDGET_POSITION,
+                    },
+                ),
+            ]
+            .into(),
+        };
+        let record = JsObject::from_iter([
+            ("xpath".to_owned(), json!("/div[1]")),
+            ("position".to_owned(), json!("378|359")),
+        ]);
+        assert_eq!(placement(&fields, &record).unwrap(), (378.0, 359.0));
+        assert!(placement(&fields, &JsObject::new()).is_err());
     }
 
     #[test]

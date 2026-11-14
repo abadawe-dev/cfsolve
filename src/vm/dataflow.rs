@@ -3,6 +3,7 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, VecDeque};
+use std::iter;
 use std::ops::ControlFlow;
 
 use super::{Listing, Path};
@@ -22,16 +23,24 @@ impl<K: Ord + Clone, V: PartialEq + Clone> Facts for BTreeMap<K, V> {
     }
 }
 
+/// Sets `key` to `value`, or forgets it when `value` is unknown.
+pub(crate) fn assign<K: Ord, V>(facts: &mut BTreeMap<K, V>, key: K, value: Option<V>) {
+    match value {
+        Some(value) => facts.insert(key, value),
+        None => facts.remove(&key),
+    };
+}
+
 /// Computes entry facts for instructions reachable from `entries`. `transfer` updates a copy of
 /// facts for one instruction path and reports whether it can run, or stops the analysis. Facts
 /// propagate through the exit only if the path can run.
 ///
 /// Only recorded exits propagate facts, so function entries and hidden branch targets need
 /// explicit entries. Reaching a position without an instruction ends that path.
-pub(crate) fn forward<F: Facts, B>(
-    listing: &Listing,
+pub(crate) fn forward<'listing, F: Facts, B>(
+    listing: &'listing Listing,
     entries: impl IntoIterator<Item = (u32, F)>,
-    mut transfer: impl FnMut(u32, &Path, &mut F) -> ControlFlow<B, bool>,
+    mut transfer: impl FnMut(u32, &'listing Path, &mut F) -> ControlFlow<B, bool>,
 ) -> ControlFlow<B, BTreeMap<u32, F>> {
     let mut incoming = BTreeMap::new();
     let mut pending = VecDeque::new();
@@ -42,9 +51,9 @@ pub(crate) fn forward<F: Facts, B>(
         let Some(instruction) = listing.instructions.get(&pc) else {
             continue;
         };
-        let entry = incoming[&pc].clone();
-        for path in &instruction.paths {
-            let mut facts = entry.clone();
+        // The last path takes the entry facts rather than a copy.
+        let entries = iter::repeat_n(incoming[&pc].clone(), instruction.paths.len());
+        for (path, mut facts) in iter::zip(&instruction.paths, entries) {
             match transfer(pc, path, &mut facts) {
                 ControlFlow::Break(stop) => return ControlFlow::Break(stop),
                 ControlFlow::Continue(false) => continue,

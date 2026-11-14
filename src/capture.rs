@@ -29,6 +29,7 @@ pub use profile::fill as fill_profile;
 pub use proxy::{CA_HOST, CA_PATH, CaptureProxy, Config};
 pub use recorded::{CapturedSession, Recording};
 pub use recorder::{CHALLENGE_HOST, ChallengePost, Posted, Recorder, RewrittenIframe};
+pub use sessions::reread as reread_session;
 pub use traffic::SentHeaders;
 #[cfg(feature = "internals")]
 pub use upstream::{Credentials, UpstreamProxy};

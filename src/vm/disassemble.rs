@@ -26,7 +26,7 @@ use super::output::{
     Constant, Effect, Exit, Failure, Hidden, Instruction, Listing, Path, Position, Term,
 };
 use super::value::Value;
-use super::{HashMap, convert, dataflow, packed_names};
+use super::{HashMap, convert, dataflow, encoded_strings, packed_names};
 use crate::{candidates, profiling};
 
 impl Machine<'_> {
@@ -73,6 +73,7 @@ impl Machine<'_> {
         listing.failures.sort_unstable_by_key(|failure| failure.pc);
         fuse_method_calls(&mut listing);
         packed_names::fold(&mut listing);
+        encoded_strings::fold(&mut listing);
         profiling::report("VM");
         Ok(listing)
     }
