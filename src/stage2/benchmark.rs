@@ -173,7 +173,7 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
     let sources: Vec<String> = strings
         .iter()
         .filter(|text| text.contains("WebAssembly"))
-        .filter_map(|source| crate::deobfuscate(source.clone()).ok())
+        .filter_map(|source| crate::deobfuscate::deobfuscate(source.clone()).ok())
         .map(|deobfuscated| deobfuscated.text)
         .collect();
     let parsed = sources
