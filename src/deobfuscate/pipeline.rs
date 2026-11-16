@@ -201,8 +201,10 @@ fn settle<'a>(
 ) -> Option<Unconverged> {
     let mut unchanged = HashMap::default();
     let mut version = 0;
+    // The printed program as each round starts: a round that changes the tree but not its
+    // printed form has converged. The next round starts from the text this one ends with.
+    let mut printed = print(program);
     for _ in 0..MAX_ROUNDS {
-        let before = print(program);
         let mut changed = false;
         for step in steps.clone() {
             changed |= apply(program, analysis, step, &mut version, &mut unchanged);
@@ -218,9 +220,14 @@ fn settle<'a>(
                 }
             }
         }
-        if !changed || print(program) == before {
+        if !changed {
             return None;
         }
+        let after = print(program);
+        if after == printed {
+            return None;
+        }
+        printed = after;
     }
     Some(Unconverged { rounds: MAX_ROUNDS })
 }
