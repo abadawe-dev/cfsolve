@@ -5,9 +5,9 @@
 //! frames that stack extraction needs. The later steps inline helpers and reconstruct control
 //! flow.
 
-use std::fmt;
+use std::{fmt, panic, thread};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use oxc::allocator::{Allocator, CloneIn, GetAllocator};
 use oxc::ast::ast::Program;
 use oxc::codegen::{Codegen, CodegenOptions, CommentOptions};
@@ -23,7 +23,7 @@ use super::{
     register_arrays, simplify, state_machines, statements, static_members, unused_bindings,
 };
 use crate::js::ast::ParsedScript;
-use crate::profiling;
+use crate::{deep_stack, profiling};
 
 /// Rewritten JavaScript and convergence diagnostics.
 pub struct Deobfuscated {
@@ -127,28 +127,18 @@ pub(super) fn parse<'a>(
         "cannot parse challenge.js: {:?}",
         parsed.diagnostics
     );
-    let analysis = analyze(allocator, &parsed.program, true)?;
-    Ok((parsed.program, analysis))
-}
-
-/// Resolves the bindings of a program that parsed without errors. With `check`, also rejects
-/// early errors such as redeclarations; copies of a checked program need not repeat it.
-fn analyze<'a>(
-    allocator: &'a Allocator,
-    program: &Program<'a>,
-    check: bool,
-) -> Result<Analysis<'a>> {
+    // Resolves the bindings, rejecting early errors such as redeclarations.
     let semantic = SemanticBuilder::new()
-        .with_check_syntax_error(check)
-        .build(program);
+        .with_check_syntax_error(true)
+        .build(&parsed.program);
     ensure!(
         semantic.diagnostics.is_empty(),
         "invalid challenge.js: {:?}",
         semantic.diagnostics
     );
     let mut analysis = Analysis::new(allocator, semantic.semantic.into_scoping());
-    analysis.refresh(program);
-    Ok(analysis)
+    analysis.refresh(&parsed.program);
+    Ok((parsed.program, analysis))
 }
 
 pub(super) fn print(program: &Program<'_>) -> String {
@@ -261,25 +251,37 @@ pub(crate) fn decode(source: String) -> Result<ParsedScript> {
     })
 }
 
-/// Runs full deobfuscation and returns a decoding-only copy of the tree, as [`decode`] does,
-/// without parsing twice. The copy gets its own semantic analysis. `read` sees the fully
-/// rewritten tree after hygiene.
-pub(crate) fn deobfuscate_capturing<T>(
+/// Runs full deobfuscation and returns the script as [`decode`] decodes it. The full rewrite
+/// runs on a thread of its own, with its own parse, while this one decodes, so the decoding
+/// costs no time beside it. `read` sees the fully rewritten tree after hygiene.
+pub(crate) fn deobfuscate_capturing<T: Send>(
     source: String,
-    read: impl FnOnce(&Program<'_>) -> Result<T>,
+    read: impl FnOnce(&Program<'_>) -> Result<T> + Send,
 ) -> Result<(Deobfuscated, T, ParsedScript)> {
     let mut full = None;
     let decoded = ParsedScript::build("decoded challenge.js", source, |owned, source| {
-        let allocator = Allocator::default();
-        let (mut program, mut analysis) = parse(&allocator, source)?;
-        let mut decoded = program.clone_in_with_semantic_ids(owned);
-        let mut decoding = analyze(owned, &decoded, false)?;
-        settle(&mut decoded, &mut decoding, DECODE.iter(), false);
-        let deobfuscated = rewrite(&mut program, &mut analysis);
-        full = Some((deobfuscated, read(&program)?));
-        Ok(decoded)
+        thread::scope(|scope| {
+            let rewriting = thread::Builder::new()
+                .name("deobfuscation".into())
+                .stack_size(deep_stack::STACK_SIZE)
+                .spawn_scoped(scope, || {
+                    let allocator = Allocator::default();
+                    let (mut program, mut analysis) = parse(&allocator, source)?;
+                    let deobfuscated = rewrite(&mut program, &mut analysis);
+                    profiling::report("deobfuscation");
+                    anyhow::Ok((deobfuscated, read(&program)?))
+                })
+                .context("starting the deobfuscation thread")?;
+            let (mut decoded, mut decoding) = parse(owned, source)?;
+            settle(&mut decoded, &mut decoding, DECODE.iter(), false);
+            profiling::report("decoding");
+            let rewritten = rewriting
+                .join()
+                .unwrap_or_else(|panic| panic::resume_unwind(panic));
+            full = Some(rewritten?);
+            Ok(decoded)
+        })
     })?;
     let (deobfuscated, result) = full.expect("the build closure ran");
-    profiling::report("deobfuscation");
     Ok((deobfuscated, result, decoded))
 }
