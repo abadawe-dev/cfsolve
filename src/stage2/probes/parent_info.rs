@@ -44,6 +44,14 @@ pub enum Read {
 }
 
 impl Fields {
+    /// The output field holding `signals[index]` as it is, if the probe copies it so.
+    #[must_use]
+    pub(crate) fn element(&self, index: usize) -> Option<&str> {
+        (self.reads.iter())
+            .find(|(_, read)| **read == Read::Element { index })
+            .map(|(field, _)| field.as_str())
+    }
+
     /// The record the probe writes from `signals`. Fields holding `undefined` are left out, as
     /// the payload's JSON leaves them out.
     #[must_use]

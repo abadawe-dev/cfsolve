@@ -206,6 +206,9 @@ pub(crate) struct PageSignals {
 }
 
 impl PageSignals {
+    /// Where [`Self::elements`] holds the widget wrapper's `top|right` (`pi.wp`).
+    pub(crate) const WIDGET_POSITION: usize = 27;
+
     /// The array `api.js` sends. Its order is that of the named fields earlier builds sent,
     /// noted beside each element. `pac` and `pad` are `undefined` when `api.js` leaves them out.
     #[must_use]
@@ -1015,6 +1018,10 @@ mod tests {
             r#"false,813,"hidden",1280,"113.875|1272","/div[1]/div[1]",1280]"#,
         );
         assert_eq!(json!(signals).stringify().as_deref(), Some(expected));
+        assert_eq!(
+            signals.elements()[PageSignals::WIDGET_POSITION],
+            "113.875|1272"
+        );
     }
 
     /// Checks `ffp`, `pac`, and `pad` for forms and nearby controls. Without a surrounding
